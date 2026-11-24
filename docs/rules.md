@@ -21,7 +21,7 @@ cj/api/ (接口层) -> cj/services/ (业务编排层) -> cj/repositories/ (数�
 * **`cj/core/`（基础层）**：承载静态配置、进程内事件总线、统一代理网络客户端与定时调度器。
 
 ### 生命周期与事件解耦
-1. **进程内事件总线（`cj/core/events.py`）**：爬虫落库后仅发布领域事件（如 `ccu.listed`、`ccu.price_changed`、`i18n.updated`），Webhook 引擎作为订阅者异步消费。
+1. **进程内事件总线（`cj/core/events.py`）**：爬虫落库后仅发布领域事件（如 `ccu.listed`、`ccu.price_changed`、`store.listed`、`store.price_changed`、`i18n.updated`），Webhook 引擎作为订阅者异步消费并按 `ccu.warbond_upgrade` / `store.warbond_ship` / `store.special_sale` / `ccu.new_listing` / `ccu.price_changed` 事件类型路由过滤。
 2. **提交后再发事件**：所有外部副作用（Webhook 推送等）**必须在数据库事务成功提交（commit）之后触发**，严禁在未提交的事务中发射事件。
 3. **优雅启停（FastAPI `lifespan`）**：
    * 启动顺序：`校验静态配置 -> 初始化 DB 连接池 -> 初始化全局代理 httpx 客户端 -> 注册事件订阅 -> 启动定时调度器`。
@@ -48,12 +48,16 @@ cj/api/ (接口层) -> cj/services/ (业务编排层) -> cj/repositories/ (数�
 
 ## 3. 网络、配置与安全红线
 
-* **统一出口代理**：所有出站 HTTP 请求必须通过 `cj/core/net.py` 提供的共享 `httpx.AsyncClient(trust_env=True)` 发起，严禁在业务代码中散落裸 `requests` 或 `httpx` 调用。Webhook 推送需根据 `WEBHOOK_USE_PROXY` 环境变量决定是否走代理。
+* **统一出口代理**：所有出站 HTTP 请求（含 RSI、Wiki、UEX、GitHub、OIDC Discovery/Token/JWKS、AI 翻译、Webhook）必须通过 `cj/core/net.py` 提供的共享网络管理器发起，严禁在业务代码中散落裸 `requests` 或 `httpx` 调用。Webhook 推送需根据 `WEBHOOK_USE_PROXY` 环境变量决定是否走代理。
 * **静/动态配置分离**：
-  * **静态配置**（`cj/core/config.py`，基于 `pydantic-settings`）：`DATABASE_URL`、`HTTP_PROXY`、`PORT` 等基础设施参数，启动时强校验（Fail Fast）。
-  * **动态配置**（数据库 `system_settings` 表）：抓取频率、汉化词典源 URL、默认显示语言、日志保留天数等，支持前端热更新。
+  * **静态配置**（`cj/core/config.py`，基于 `pydantic-settings`）：`DATABASE_URL`、`HTTP_PROXY`、`PORT`、`AUTH_REQUIRE_LOGIN`（全站强制登录开关，Web UI 不可修改）、`AUTH_SECRET_KEY`、`AUTH_REGISTRATION_MODE`、`INIT_ADMIN_*`、`UPGRADE_PLANNER_ENABLED` 等基础设施与访问边界参数（项目 `.env` 优先于宿主机环境变量）。
+  * **动态配置**（数据库 `system_settings` 表）：抓取频率、目录同步间隔、汉化词典源 URL（前端共置于「舰船词典」）、默认显示语言、日志保留天数、升级路线规划开关（默认关闭）、本地账号注册模式（`SystemConfigKey.REGISTRATION_MODE`：关闭/邀请制/开放）、OIDC SSO 参数与自动翻译参数等，支持前端热更新。
 * **配置键枚举化**：所有动态配置键必须统一定义在 `SystemConfigKey` 枚举中，**严禁在代码中使用魔法字符串**（如 `get("scrape_interval")`）。
-* **敏感信息脱敏**：严禁在日志、Webhook 推送日志或 API 响应中明文输出密钥（包括 `DATABASE_URL` 密码、代理认证信息、翻译 API Key、Webhook `Authorization` Header 等）。前端展示敏感配置时必须做脱敏处理。
+* **全站访问控制与多角色 RBAC 鉴权**：
+  * 全站强制登录仅由环境变量 `AUTH_REQUIRE_LOGIN`（默认 `true`）控制且不支持通过 Web UI 修改；浏览类端点挂载 `require_site_access`，个人安全端点挂载 `require_authenticated_user`，管理写接口与用户/配置/Webhook 管理挂载 `require_admin_user`。
+  * 会话同时支持 `Authorization: Bearer <jwt>` 与 `HttpOnly` `cj_session` Cookie，并实时校验数据库 `is_active` 与 `token_version`（改密/禁用/改角色后立即失效旧令牌）；`ADMIN_TOKEN` 仅保留作向后兼容脚本令牌。
+  * OIDC SSO 采用 Authorization Code + PKCE（`S256` 无 `client_secret`）公共客户端流，必须在独立 `oidc_states` 表核验一次性 `state` 与 `nonce` 并通过 JWKS 验签 `id_token`。
+* **敏感信息脱敏与密码学存储**：统一通过 `cj/core/security.py` 处理敏感信息：用户密码一律使用 Argon2id 单向哈希、TOTP 密钥一律经 Fernet 对称加密存储，严禁在日志或 API 响应中泄露密码、JWT、OTP Base32 密钥、`code_verifier`、`code`、`id_token`、`access_token`、`DATABASE_URL` 密码及敏感 Header。前端编辑规则回传 `******` 掩码占位符时，服务端必须保留库中原密钥。
 * **路径安全**：所有本地文件与目录操作必须使用 `pathlib.Path`，禁止使用原始字符串拼接路径。
 
 ---
@@ -80,6 +84,14 @@ cj/api/ (接口层) -> cj/services/ (业务编排层) -> cj/repositories/ (数�
   * **Docker 友好**：对于 docker 项目，默认输出至 `stdout/stderr` 以便直接通过 `docker logs` 查看；同时支持通过环境变量 `LOG_TO_FILE=true` 开启本地轮转文件日志（存放在 `./data/logs/ccujailer.log`，单文件上限 10MB，保留最近 5 份）。
 * **日志内容要求**：日志文案统一使用英文；记录错误时必须包含关键上下文（如船名、规则名、HTTP 状态码、耗时），但**严禁输出任何明文密钥、密码或敏感 Header**。
 
+
+### 前端 UI、设计令牌与无障碍规范
+* **三层令牌与对比度**：`frontend/src/style.css` 统一维护 Primitive -> Semantic -> Component 三层 CSS 变量，禁止在组件中硬编码覆盖深浅主题色值或大面积内联 `style`；浅色与夜间模式文本均须满足 WCAG AA >= 4.5:1 对比度，并保持 `theme-color` 元标签与 `color-scheme` 同步。
+* **布局与交互一致性**：顶部导航使用品牌图标（`public/favicon.svg`），紧邻站名展示服务版本号（如 `v0.1.0`）与 GitHub 项目主页入口，页脚同步标注版本及 GitHub 主页外链；主标签使用「在售舰船」；桌面端主容器自适应视口宽度（`max-width: min(1760px, 100%)`），页脚说明全宽平铺，版本价格卡片统一把 `WARBOND 升级` 置于最左侧，紧接 `WARBOND 整船`、`Best in Show`、弱化底色常驻 `10 Year` 及绿色 `IN GAME` 卡片并保持等高对齐；列表行 `.nearest-row` 仅显示最低加价单档位的候选升级底船；舰船详情通过悬浮模态框呈现，悬浮详情弹窗内各个详情卡片与 Webhook 规则卡片支持折叠状态与拖曳/键盘调序（持久化于 `localStorage`），Webhook 编辑弹窗将推送目标与自定义请求头置于同一区块，远程汉化词典源 URL 与词典管理共置于 `ShipsView`，顶部账号菜单统一承载账号切换、添加与安全入口。
+* **可访问性与交互细节**：
+  * 必须保留 `.skip-link`、全局 `:focus-visible`（Compound 控件使用 `:focus-within`）以及模态框 `role="dialog"`、`aria-modal="true"`、`Escape` 键关闭；纯图标按钮必须声明 `aria-label`，装饰性 SVG/图标必须声明 `aria-hidden="true"`。
+  * 严格**禁止使用 `transition: all`**，所有过渡与动画必须显式列出属性并包裹于 `@media (prefers-reduced-motion: no-preference)`。
+  * 移动端（`<= 720px`）交互控件热区与滚动区域须满足零横向溢出（`documentElement.scrollWidth <= window.innerWidth`）、支持 `touch-action: manipulation`、`overscroll-behavior: contain`（抽屉/弹窗）及安全区底部内边距。
 
 ### 命名与代码风格
 * **文件与目录**：使用 `snake_case`；当单一能力需要多个文件时，建同名包并使用单词子文件（如 `services/webhook.py`），避免平铺冗长前缀。
@@ -144,12 +156,14 @@ def find_nearest_from_ships(target_price: float, limit: int = 5) -> list[dict]:
   uv export --quiet --locked --no-dev --no-emit-project -o /tmp/audit-req.txt
   uvx --from pip-audit pip-audit --require-hashes --disable-pip --strict -r /tmp/audit-req.txt
 
-  # 前端类型检查
-  cd frontend && npx tsc --noEmit
+  # 前端类型检查、构建与 Playwright 桌面/移动端端到端验收
+  cd frontend && npx tsc --noEmit && npx vue-tsc --noEmit && npm run build
   ```
-* **测试覆盖**：修复 Bug 前优先补充复现测试；核心算法（如 `nearest_from_ships` 差价计算、Webhook 多条件过滤匹配、双语搜索匹配）必须具备 `pytest` 单元测试。
-* **提交信息（Conventional Commits）**：格式为 `<type>(<scope>): <description>`，标题不超过 72 字符，支持类型：`feat`、`fix`、`docs`、`chore`、`refactor`、`test`、`ci`。
-* **开源协议合规**：保留仓库根目录的 AGPL-3.0 `LICENSE` 文件及上游 `DieLaughing/pledgewatch` 版权声明。
+* **测试覆盖**：修复 Bug 前优先补充复现测试；核心算法（如 `nearest_from_ships` 差价计算、Webhook 多条件过滤匹配与多平台渲染、四级汉化词典解析与双语索引、防降级迁移校验）必须具备 `pytest` 单元测试；UI 或交互调整后需基于 `playwright-skill` 在桌面端（`1440×900`）与移动端（`390×844` / `375×812`）验证零 Console/Runtime 报错、零横向溢出及视觉截图巡检。
+* **提交信息（Conventional Commits + AI Trailer）**：格式为 `<type>(<scope>): <description>`，标题不超过 72 字符，支持类型：`feat`、`fix`、`docs`、`chore`、`refactor`、`test`、`ci`。执行 `git commit` 时必须在提交信息末尾附加标准 AI 与 Harness Trailer（如 `Assisted-by: Gemini` 与 `Assisted-by: Antigravity`，不写具体版本号，无官方邮箱时严禁伪造邮箱）。
+* **开源协议与文档规范**：
+  * 保留仓库根目录的 AGPL-3.0 `LICENSE` 文件及上游 `DieLaughing/pledgewatch` 衍生版权声明。
+  * 更新 `README.md` 时必须在顶部包含统一 `style=for-the-badge` 风格的 Shields.io Badges（仓库统计、Docker/GHCR 镜像、支持平台及 `LINUX DO` 徽章），并包含「AI 使用声明 / Acknowledgements」小节。
 * **诚实汇报原则**：严禁宣称未执行的测试或检查项已通过；交付改动时必须如实列出实际运行过的验证命令与结果。
 ---
 
@@ -167,8 +181,9 @@ def find_nearest_from_ships(target_price: float, limit: int = 5) -> list[dict]:
 | 变更项 | 必须同步更新 |
 | :--- | :--- |
 | 数据库 ORM 模型（`cj/db/`） | 新增 Alembic 迁移脚本（`backend/alembic/versions/`） |
-| 静态环境变量（`cj/core/config.py`） | `.env.example`、`docker-compose.yml` 与 `DESIGN.md` |
+| 静态环境变量（`cj/core/config.py`） | `.env.example`、`docker-compose.yml` 与 `docs/architecture-overview.md` |
 | 后端依赖（`pyproject.toml`） | `uv.lock`（并通过 `uv lock --check` 与 `pip-audit`） |
 | REST API 结构（`cj/api/`） | 前端对应 TypeScript 类型定义、调用代码与单测 |
 | 动态配置键（`SystemConfigKey`） | `/api/v1/settings` 接口与前端设置页表单 |
+| 架构或规范约定修正 | `docs/architecture-overview.md` 与 `docs/rules.md` |
 

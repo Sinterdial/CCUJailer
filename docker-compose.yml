@@ -1,0 +1,61 @@
+services:
+  ccujailer:
+    image: ghcr.io/sinterdial/ccujailer:latest
+    # 如需本地直接构建镜像，可取消下一行注释：
+    # build: .
+    container_name: ccujailer
+    restart: unless-stopped
+    ports:
+      - "8794:8794"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - AUTO_MIGRATE=true
+      # 默认使用 SQLite（/app/data/ccujailer.db，自动持久化到 ./data）；若启用下方 postgres 服务，请取消下行注释：
+      # - DATABASE_URL=postgresql+asyncpg://ccujailer:changeme@postgres:5432/ccujailer
+      # 全站强制登录仅支持环境变量配置（Web UI 不可修改）；初始管理员与 ZITADEL OIDC PKCE SSO 可留空通过网页引导与系统设置配置
+      - AUTH_REQUIRE_LOGIN=true
+      - AUTH_REGISTRATION_MODE=closed
+      - AUTH_SECRET_KEY=
+      - INIT_ADMIN_USERNAME=
+      - INIT_ADMIN_PASSWORD=
+      - OIDC_ENABLED=false
+      - OIDC_PROVIDER_NAME=ZITADEL
+      - OIDC_ISSUER_URL=
+      - OIDC_CLIENT_ID=
+      - OIDC_SCOPES=openid profile email
+      - OIDC_AUTO_REGISTER=true
+      - OIDC_DEFAULT_ROLE=user
+      # 可选：脚本调用向后兼容静态令牌（留空仅使用用户账号/SSO）
+      - ADMIN_TOKEN=
+      # 升级路线规划功能开关（默认关闭；可在「系统设置 -> 系统参数」中热切换）
+      - UPGRADE_PLANNER_ENABLED=false
+      # 可选：出站代理配置（用于访问 RSI 商店或海外站点，需要使用时取消注释）
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - ALL_PROXY=
+      - NO_PROXY=localhost,127.0.0.1,postgres
+      - WEBHOOK_USE_PROXY=false
+      # 可选：OpenAI 兼容自动翻译密钥
+      - TRANSLATE_API_KEY=
+      # 日志级别与本地轮转文件开关
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=false
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ccujailer-db
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=ccujailer
+      - POSTGRES_PASSWORD=changeme
+      - POSTGRES_DB=ccujailer
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccujailer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

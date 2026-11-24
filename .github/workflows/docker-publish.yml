@@ -1,0 +1,110 @@
+name: Docker Quality Gate & Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  quality-gate:
+    name: Backend & Frontend Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.14
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install backend locked dependencies
+        working-directory: backend
+        run: uv sync --locked
+
+      - name: Verify uv.lock consistency
+        working-directory: backend
+        run: uv lock --check
+
+      - name: Run Ruff lint check
+        working-directory: backend
+        run: uv run --locked --no-sync ruff check .
+
+      - name: Run Pytest suite
+        working-directory: backend
+        run: uv run --locked --no-sync pytest -v
+
+      - name: Run pip-audit dependency vulnerability scan
+        working-directory: backend
+        run: |
+          uv export --quiet --locked --no-dev --no-emit-project -o /tmp/audit-req.txt
+          uvx --from pip-audit pip-audit --require-hashes --disable-pip --strict -r /tmp/audit-req.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies and verify build
+        working-directory: frontend
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npx vue-tsc --noEmit
+          npm run build
+
+  build-and-push:
+    name: Build & Push Multi-Arch Image
+    needs: quality-gate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ccujailer
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push multi-arch container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

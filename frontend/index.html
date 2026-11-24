@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" id="theme-color-meta" content="#f5f7fa" />
+    <title>CCUJailer</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("ccujailer_theme_mode") || "system";
+          var prefersDark =
+            window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var resolvedDark = t === "dark" || (t !== "light" && prefersDark);
+          if (t === "light" || t === "dark") {
+            document.documentElement.dataset.theme = t;
+          } else {
+            document.documentElement.removeAttribute("data-theme");
+          }
+          var meta = document.getElementById("theme-color-meta");
+          if (meta) {
+            meta.setAttribute("content", resolvedDark ? "#0d1117" : "#f5f7fa");
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

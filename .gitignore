@@ -1,8 +1,27 @@
-.venv/
-data/
+# Python & virtual environments
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
 .pytest_cache/
-*.env
-web/node_modules/
-web/dist/
-.cloudflare/
+.ruff_cache/
+
+# Node & frontend build output
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local data, database files, backups & secrets
+data/
+pgdata/
+.env
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

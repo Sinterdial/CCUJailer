@@ -1,0 +1,16 @@
+.git/
+.github/
+.idea/
+.venv/
+data/
+pgdata/
+docs/
+backend/.env
+backend/.venv/
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/data/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+**/*.pyc

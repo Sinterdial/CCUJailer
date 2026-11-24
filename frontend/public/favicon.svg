@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="CCU Jailer — Ship Upgrade Price Monitor Emblem">
+  <rect width="512" height="512" rx="48" fill="#F8F9FF"/>
+
+  <!-- Outer tactical shield / reticle frame -->
+  <circle cx="256" cy="256" r="204" fill="#FFFFFF" stroke="#C1C7D1" stroke-width="4"/>
+  <circle cx="256" cy="256" r="186" fill="none" stroke="#004475" stroke-width="6" stroke-dasharray="28 14"/>
+
+  <!-- Cardinal radar crosshair ticks (Monitor / Watchman) -->
+  <g stroke="#004475" stroke-width="8" stroke-linecap="round">
+    <line x1="256" y1="44" x2="256" y2="78"/>
+    <line x1="256" y1="434" x2="256" y2="468"/>
+    <line x1="44" y1="256" x2="78" y2="256"/>
+    <line x1="434" y1="256" x2="468" y2="256"/>
+  </g>
+
+  <!-- Jailer (监管者): Bold geometric surveillance eye / scanner aperture -->
+  <path
+    d="M 76 256 C 128 164, 384 164, 436 256 C 384 348, 128 348, 76 256 Z"
+    fill="#F2F3F9"
+    stroke="#004475"
+    stroke-width="14"
+    stroke-linejoin="round"
+  />
+
+  <!-- Inner iris / price-watch ring -->
+  <circle cx="256" cy="256" r="88" fill="#FFFFFF" stroke="#0A5C99" stroke-width="8"/>
+
+  <!-- Amber price-fluctuation / CCU telemetry arc -->
+  <path
+    d="M 180 286 L 214 268 L 236 282 L 278 232 L 304 244 L 332 214"
+    fill="none"
+    stroke="#8B4700"
+    stroke-width="6"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.35"
+  />
+
+  <!-- CCU (船升级): Stylized ascending spacecraft + upward upgrade chevrons -->
+  <g>
+    <!-- Lower CCU step-up chevron -->
+    <polyline
+      points="210,318 256,282 302,318"
+      fill="none"
+      stroke="#8B4700"
+      stroke-width="12"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <!-- Ascending delta-wing Star Citizen ship silhouette -->
+    <polygon
+      points="256,174 282,232 316,268 274,264 256,282 238,264 196,268 230,232"
+      fill="#004475"
+    />
+    <!-- Ship cockpit / core highlight -->
+    <polygon
+      points="256,196 266,226 256,246 246,226"
+      fill="#9ECAFF"
+    />
+    <!-- Twin upgrade thrust / trajectory lines -->
+    <line x1="242" y1="276" x2="242" y2="296" stroke="#8B4700" stroke-width="6" stroke-linecap="round"/>
+    <line x1="270" y1="276" x2="270" y2="296" stroke="#8B4700" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>
