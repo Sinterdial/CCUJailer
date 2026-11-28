@@ -8,12 +8,14 @@
 import base64
 import hashlib
 import io
+import ipaddress
+import json
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import jwt
@@ -21,19 +23,52 @@ import pyotp
 import segno
 from jwt import InvalidTokenError, PyJWKSet
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from webauthn import (
+    generate_authentication_options,
+    generate_registration_options,
+    options_to_json,
+    verify_authentication_response,
+    verify_registration_response,
+)
+from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from webauthn.helpers.exceptions import WebAuthnException
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    AuthenticatorTransport,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
 
 from cj import APP_VERSION, GITHUB_REPO_URL
-from cj.core.config import RegistrationMode, Settings, UserRole
+from cj.core.config import (
+    VALID_STORE_FILTER_KEYS,
+    VALID_STORE_SORT_KEYS,
+    RegistrationMode,
+    Settings,
+    UserRole,
+)
 from cj.core.logging import get_logger
 from cj.core.net import NetworkManager
 from cj.core.security import (
     decrypt_secret,
     encrypt_secret,
+    generate_totp_backup_codes,
+    hash_backup_code,
     hash_password,
+    match_and_consume_backup_code,
     resolve_or_create_secret_key,
     verify_password,
 )
-from cj.db.models import InviteCode, OidcState, User, ensure_utc, utc_now
+from cj.db.models import (
+    InviteCode,
+    OidcState,
+    User,
+    UserPasskey,
+    WebAuthnChallenge,
+    ensure_utc,
+    utc_now,
+)
 from cj.repositories.user_repo import UserRepository
 from cj.services.setting_service import SettingService
 
@@ -41,6 +76,120 @@ logger = get_logger(__name__)
 
 _USERNAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _ALLOWED_ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"]
+_VALID_DETAIL_CARD_IDS = (
+    "ingame",
+    "insurance",
+    "weapons",
+    "loadouts",
+    "donors",
+    "history",
+    "cargo",
+)
+
+
+def sanitize_user_preferences(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    校验并清洗用户个人跨设备偏好设置字典，确保字段类型与边界合法。
+
+    @param raw: 原始 JSON 偏好字典
+    @return: 清洗后的安全偏好字典（空值或跟随默认键将省略）
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    cleaned: dict[str, Any] = {}
+
+    lang = raw.get("language_mode")
+    if isinstance(lang, str) and lang in ("bilingual", "zh", "en"):
+        cleaned["language_mode"] = lang
+
+    theme = raw.get("theme_mode")
+    if isinstance(theme, str) and theme in ("system", "light", "dark"):
+        cleaned["theme_mode"] = theme
+
+    rate = raw.get("auec_rate")
+    if isinstance(rate, int | float) and not isinstance(rate, bool):
+        cleaned["auec_rate"] = max(1000, min(100_000_000, int(rate)))
+
+    detail_order = raw.get("details_card_order")
+    if isinstance(detail_order, list):
+        valid_set = set(_VALID_DETAIL_CARD_IDS)
+        ordered = [
+            item
+            for item in dict.fromkeys(str(x).strip() for x in detail_order)
+            if item in valid_set
+        ]
+        for default_id in _VALID_DETAIL_CARD_IDS:
+            if default_id not in ordered:
+                ordered.append(default_id)
+        cleaned["details_card_order"] = ordered
+
+    detail_collapsed = raw.get("details_collapsed_cards")
+    if isinstance(detail_collapsed, list):
+        valid_set = set(_VALID_DETAIL_CARD_IDS)
+        cleaned["details_collapsed_cards"] = [
+            item
+            for item in dict.fromkeys(str(x).strip() for x in detail_collapsed)
+            if item in valid_set
+        ]
+
+    wh_order = raw.get("webhook_card_order")
+    if isinstance(wh_order, list):
+        cleaned["webhook_card_order"] = [
+            str(x).strip()
+            for x in wh_order
+            if isinstance(x, str) and x.strip() and len(x.strip()) <= 64
+        ][:200]
+
+    wh_collapsed = raw.get("webhook_collapsed_ids")
+    if isinstance(wh_collapsed, list):
+        cleaned["webhook_collapsed_ids"] = [
+            str(x).strip()
+            for x in wh_collapsed
+            if isinstance(x, str) and x.strip() and len(x.strip()) <= 64
+        ][:200]
+
+    owned_ccus = raw.get("owned_ccus")
+    if isinstance(owned_ccus, list):
+        pairs: list[list[int]] = []
+        seen_pairs: set[tuple[int, int]] = set()
+        for entry in owned_ccus:
+            if (
+                isinstance(entry, list | tuple)
+                and len(entry) == 2
+                and isinstance(entry[0], int)
+                and isinstance(entry[1], int)
+                and entry[0] > 0
+                and entry[1] > 0
+            ):
+                pair = (entry[0], entry[1])
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    pairs.append([pair[0], pair[1]])
+            if len(pairs) >= 200:
+                break
+        cleaned["owned_ccus"] = pairs
+
+    # default_store_filters 允许为空列表 []（表示用户显式覆盖为全不选），None 表示跟随系统默认
+    if "default_store_filters" in raw and raw["default_store_filters"] is not None:
+        raw_filters = raw["default_store_filters"]
+        if isinstance(raw_filters, list):
+            valid_f = set(VALID_STORE_FILTER_KEYS)
+            cleaned["default_store_filters"] = [
+                item
+                for item in dict.fromkeys(str(x).strip() for x in raw_filters)
+                if item in valid_f
+            ]
+
+    default_sort = raw.get("default_store_sort")
+    if isinstance(default_sort, str) and default_sort.strip() in VALID_STORE_SORT_KEYS:
+        cleaned["default_store_sort"] = default_sort.strip()
+
+    page_size = raw.get("store_page_size")
+    if isinstance(page_size, int | float) and not isinstance(page_size, bool):
+        cleaned["store_page_size"] = max(0, min(500, int(page_size)))
+
+    return cleaned
 
 
 class AuthError(Exception):
@@ -77,6 +226,8 @@ class AuthenticatedUser:
     @ivar totp_enabled: 是否已开启 OTP 二步验证
     @ivar has_password: 是否设置了本地密码
     @ivar oidc_bound: 是否已绑定 OIDC SSO 外部身份
+    @ivar passkey_count: 已绑定 Passkey 通行密钥数量
+    @ivar preferences: 用户跨设备个人偏好字典
     """
 
     id: int
@@ -88,6 +239,9 @@ class AuthenticatedUser:
     totp_enabled: bool
     has_password: bool
     oidc_bound: bool
+    passkey_count: int = 0
+    totp_backup_codes_remaining: int = 0
+    preferences: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,11 +263,12 @@ class LoginOutcome:
     user: AuthenticatedUser | None = None
 
 
-def _user_to_principal(user: User) -> AuthenticatedUser:
+def _user_to_principal(user: User, passkey_count: int = 0) -> AuthenticatedUser:
     """
     将数据库 User ORM 实体转换为无状态 AuthenticatedUser 值对象。
 
     @param user: User ORM 实体
+    @param passkey_count: 已绑定 Passkey 数量
     @return: AuthenticatedUser 实例
     """
     role: UserRole = "admin" if user.role == "admin" else "user"
@@ -127,14 +282,20 @@ def _user_to_principal(user: User) -> AuthenticatedUser:
         totp_enabled=user.totp_enabled,
         has_password=bool(user.password_hash),
         oidc_bound=bool(user.oidc_issuer and user.oidc_sub),
+        passkey_count=passkey_count,
+        totp_backup_codes_remaining=(
+            len(user.totp_backup_codes or []) if user.totp_enabled else 0
+        ),
+        preferences=sanitize_user_preferences(user.preferences),
     )
 
 
-def _user_to_summary(user: User) -> dict[str, Any]:
+def _user_to_summary(user: User, passkey_count: int = 0) -> dict[str, Any]:
     """
     将 User ORM 实体序列化为用户管理响应字典。
 
     @param user: User ORM 实体
+    @param passkey_count: 已绑定 Passkey 数量
     @return: 不包含任何哈希与密钥的公开用户摘要字典
     """
     return {
@@ -145,11 +306,33 @@ def _user_to_summary(user: User) -> dict[str, Any]:
         "role": "admin" if user.role == "admin" else "user",
         "is_active": user.is_active,
         "totp_enabled": user.totp_enabled,
+        "totp_backup_codes_remaining": (
+            len(user.totp_backup_codes or []) if user.totp_enabled else 0
+        ),
         "has_password": bool(user.password_hash),
         "oidc_bound": bool(user.oidc_issuer and user.oidc_sub),
+        "passkey_count": passkey_count,
+        "preferences": sanitize_user_preferences(user.preferences),
         "last_login_at": ensure_utc(user.last_login_at),
         "created_at": ensure_utc(user.created_at),
         "updated_at": ensure_utc(user.updated_at),
+    }
+
+
+def _passkey_to_summary(passkey: UserPasskey) -> dict[str, Any]:
+    """
+    将 UserPasskey ORM 实体序列化为安全公开摘要字典。
+
+    @param passkey: UserPasskey 实体
+    @return: 不包含公钥原字节的 Passkey 摘要字典
+    """
+    return {
+        "id": passkey.id,
+        "name": passkey.name,
+        "transports": list(passkey.transports or []),
+        "backed_up": bool(passkey.backed_up),
+        "last_used_at": ensure_utc(passkey.last_used_at),
+        "created_at": ensure_utc(passkey.created_at),
     }
 
 
@@ -327,6 +510,9 @@ class AuthService:
             "authenticated": principal is not None,
             "sso_enabled": sso_ready,
             "sso_provider_name": dynamic.sso_provider_name or "ZITADEL",
+            "passkey_enabled": dynamic.passkey_enabled,
+            "default_store_filters": list(dynamic.default_store_filters),
+            "default_store_sort": dynamic.default_store_sort,
             "upgrade_planner_enabled": dynamic.upgrade_planner_enabled,
             "app_version": APP_VERSION,
             "github_url": GITHUB_REPO_URL,
@@ -341,6 +527,8 @@ class AuthService:
                     "totp_enabled": principal.totp_enabled,
                     "has_password": principal.has_password,
                     "oidc_bound": principal.oidc_bound,
+                    "passkey_count": principal.passkey_count,
+                    "preferences": principal.preferences,
                 }
                 if principal is not None
                 else None
@@ -427,7 +615,8 @@ class AuthService:
 
                 user.last_login_at = utc_now()
                 token, exp = self._issue_session_token(user)
-                principal = _user_to_principal(user)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                principal = _user_to_principal(user, passkey_count=pk_counts.get(user.id, 0))
 
         logger.info("User '%s' logged in with password", principal.username)
         return LoginOutcome(
@@ -467,15 +656,32 @@ class AuthService:
                     raise AuthError("invalid_otp", "当前账号未开启 OTP 二步验证")
 
                 secret = decrypt_secret(user.totp_secret_encrypted, self._secret_key)
+                used_backup = False
                 if not pyotp.TOTP(secret).verify(clean_code, valid_window=1):
-                    logger.warning("Failed OTP challenge for user '%s'", user.username)
-                    raise AuthError("invalid_otp", "OTP 动态口令无效或已过期")
+                    matched, remaining = match_and_consume_backup_code(
+                        user.id,
+                        otp_code,
+                        list(user.totp_backup_codes or []),
+                        self._secret_key,
+                    )
+                    if not matched:
+                        logger.warning("Failed OTP challenge for user '%s'", user.username)
+                        raise AuthError("invalid_otp", "OTP 动态口令或备用恢复码无效/已过期")
+                    user.totp_backup_codes = remaining
+                    used_backup = True
 
                 user.last_login_at = utc_now()
                 token, exp = self._issue_session_token(user)
-                principal = _user_to_principal(user)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                principal = _user_to_principal(user, passkey_count=pk_counts.get(user.id, 0))
 
-        logger.info("User '%s' completed TOTP second-factor login", principal.username)
+        if used_backup:
+            logger.info(
+                "User '%s' completed second-factor login using a TOTP backup code",
+                principal.username,
+            )
+        else:
+            logger.info("User '%s' completed TOTP second-factor login", principal.username)
         return LoginOutcome(
             mfa_required=False,
             access_token=token,
@@ -508,7 +714,8 @@ class AuthService:
             user = await self._user_repo.get_by_id(session, user_id)
             if user is None or not user.is_active or user.token_version != token_ver:
                 return None
-            return _user_to_principal(user)
+            pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+            return _user_to_principal(user, passkey_count=pk_counts.get(user.id, 0))
 
     async def get_current_user_summary(self, user_id: int) -> dict[str, Any] | None:
         """
@@ -519,7 +726,10 @@ class AuthService:
         """
         async with self._session_factory() as session:
             user = await self._user_repo.get_by_id(session, user_id)
-            return _user_to_summary(user) if user else None
+            if user is None:
+                return None
+            pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+            return _user_to_summary(user, passkey_count=pk_counts.get(user.id, 0))
 
     async def change_password(
         self,
@@ -576,16 +786,17 @@ class AuthService:
         svg = _render_totp_qr_svg(uri)
         return {"secret": secret, "otpauth_uri": uri, "qr_svg": svg}
 
-    async def enable_totp(self, user_id: int, otp_code: str) -> dict[str, Any]:
+    async def enable_totp(self, user_id: int, otp_code: str) -> tuple[dict[str, Any], list[str]]:
         """
-        校验扫码后生成的 6 位动态口令并正式启用 OTP 二步验证。
+        校验扫码后生成的 6 位动态口令并正式启用 OTP 二步验证，同时签发一次性备用恢复码。
 
         @param user_id: 用户主键 ID
         @param otp_code: 6 位数字动态码
-        @return: 更新后的用户摘要字典
+        @return: (更新后的用户摘要字典, 仅本次展示的 8 个明文备用恢复码)
         @raise AuthError: 尚未发起绑定或动态码验证失败时抛出
         """
         clean_code = otp_code.strip().replace(" ", "")
+        backup_codes = generate_totp_backup_codes(8)
         async with self._session_factory() as session:
             async with session.begin():
                 user = await self._user_repo.get_by_id(session, user_id)
@@ -599,11 +810,60 @@ class AuthService:
                 user.totp_secret_encrypted = encrypt_secret(pending_secret, self._secret_key)
                 user.totp_pending_encrypted = None
                 user.totp_enabled = True
+                user.totp_backup_codes = [
+                    hash_backup_code(user.id, code, self._secret_key) for code in backup_codes
+                ]
                 user.updated_at = utc_now()
-                summary = _user_to_summary(user)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                summary = _user_to_summary(user, passkey_count=pk_counts.get(user.id, 0))
 
-        logger.info("User id=%d enabled TOTP 2FA", user_id)
-        return summary
+        logger.info("User id=%d enabled TOTP 2FA with backup codes", user_id)
+        return summary, backup_codes
+
+    async def regenerate_totp_backup_codes(
+        self,
+        user_id: int,
+        otp_code: str = "",
+        current_password: str = "",
+    ) -> list[str]:
+        """
+        核验当前 OTP 动态口令或登录密码后，重新签发一组 8 个 TOTP 一次性备用恢复码（旧码立即作废）。
+
+        @param user_id: 用户主键 ID
+        @param otp_code: 可选 6 位 OTP 动态口令
+        @param current_password: 可选当前登录密码
+        @return: 新生成的明文备用恢复码列表
+        @raise AuthError: 未开启 OTP 或凭据核验失败时抛出
+        """
+        clean_code = otp_code.strip().replace(" ", "")
+        backup_codes = generate_totp_backup_codes(8)
+        async with self._session_factory() as session:
+            async with session.begin():
+                user = await self._user_repo.get_by_id(session, user_id)
+                if user is None:
+                    raise AuthError("not_found", "用户不存在")
+                if not user.totp_enabled or not user.totp_secret_encrypted:
+                    raise AuthError("invalid_input", "当前账号尚未启用 OTP 二步验证")
+
+                verified = False
+                if clean_code:
+                    secret = decrypt_secret(user.totp_secret_encrypted, self._secret_key)
+                    verified = pyotp.TOTP(secret).verify(clean_code, valid_window=1)
+                if not verified and current_password and user.password_hash:
+                    verified = verify_password(current_password, user.password_hash)
+                if not verified:
+                    raise AuthError(
+                        "invalid_credentials",
+                        "请提供有效的 6 位动态口令或当前密码以重新生成备用恢复码",
+                    )
+
+                user.totp_backup_codes = [
+                    hash_backup_code(user.id, code, self._secret_key) for code in backup_codes
+                ]
+                user.updated_at = utc_now()
+
+        logger.info("User id=%d regenerated TOTP backup codes", user_id)
+        return backup_codes
 
     async def disable_totp(
         self,
@@ -612,10 +872,10 @@ class AuthService:
         current_password: str = "",
     ) -> dict[str, Any]:
         """
-        校验动态口令或当前密码后停用并清空账号的 OTP 二步验证配置。
+        校验动态口令、备用恢复码或当前密码后停用并清空账号的 OTP 二步验证配置。
 
         @param user_id: 用户主键 ID
-        @param otp_code: 可选 6 位 OTP 口令
+        @param otp_code: 可选 6 位 OTP 口令或备用恢复码
         @param current_password: 可选当前密码（无 OTP 设备时使用）
         @return: 更新后的用户摘要字典
         @raise AuthError: 凭据校验失败时抛出
@@ -630,19 +890,28 @@ class AuthService:
                 if clean_code and user.totp_secret_encrypted:
                     secret = decrypt_secret(user.totp_secret_encrypted, self._secret_key)
                     verified = pyotp.TOTP(secret).verify(clean_code, valid_window=1)
+                if not verified and clean_code and user.totp_backup_codes:
+                    verified, _ = match_and_consume_backup_code(
+                        user.id,
+                        otp_code,
+                        list(user.totp_backup_codes or []),
+                        self._secret_key,
+                    )
                 if not verified and current_password and user.password_hash:
                     verified = verify_password(current_password, user.password_hash)
                 if not verified:
                     raise AuthError(
                         "invalid_credentials",
-                        "请提供有效的动态口令或当前登录密码以解绑 OTP",
+                        "请提供有效的动态口令、备用恢复码或当前登录密码以解绑 OTP",
                     )
 
                 user.totp_enabled = False
                 user.totp_secret_encrypted = None
                 user.totp_pending_encrypted = None
+                user.totp_backup_codes = []
                 user.updated_at = utc_now()
-                summary = _user_to_summary(user)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                summary = _user_to_summary(user, passkey_count=pk_counts.get(user.id, 0))
 
         logger.info("User id=%d disabled TOTP 2FA", user_id)
         return summary
@@ -906,7 +1175,8 @@ class AuthService:
                     user.updated_at = now
 
                 jwt_token, exp = self._issue_session_token(user)
-                principal = _user_to_principal(user)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                principal = _user_to_principal(user, passkey_count=pk_counts.get(user.id, 0))
 
         logger.info("User '%s' logged in via OIDC PKCE SSO", principal.username)
         return LoginOutcome(
@@ -924,7 +1194,10 @@ class AuthService:
         """
         async with self._session_factory() as session:
             users = await self._user_repo.list_all(session)
-        return [_user_to_summary(u) for u in users]
+            pk_counts = await self._user_repo.count_passkeys_by_users(
+                session, [u.id for u in users]
+            )
+        return [_user_to_summary(u, passkey_count=pk_counts.get(u.id, 0)) for u in users]
 
     async def create_user(
         self,
@@ -1057,8 +1330,10 @@ class AuthService:
                 target.totp_enabled = False
                 target.totp_secret_encrypted = None
                 target.totp_pending_encrypted = None
+                target.totp_backup_codes = []
                 target.updated_at = utc_now()
-                summary = _user_to_summary(target)
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [target.id])
+                summary = _user_to_summary(target, passkey_count=pk_counts.get(target.id, 0))
 
         logger.info("Admin reset OTP 2FA for user id=%d", target_user_id)
         return summary
@@ -1288,3 +1563,542 @@ class AuthService:
 
         logger.info("Deleted invite code id=%d", invite_id)
         return True
+
+    async def get_user_preferences(self, user_id: int) -> dict[str, Any]:
+        """
+        读取已登录用户的个人跨设备网站偏好配置。
+
+        @param user_id: 用户主键 ID
+        @return: 校验清洗后的个人偏好字典
+        @raise AuthError: 用户不存在时抛出
+        """
+        if user_id == 0:
+            return {}
+        async with self._session_factory() as session:
+            user = await self._user_repo.get_by_id(session, user_id)
+            if user is None:
+                raise AuthError("not_found", "用户不存在")
+            return sanitize_user_preferences(user.preferences)
+
+    async def update_user_preferences(
+        self,
+        user_id: int,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        局部更新并持久化已登录用户的个人跨设备偏好配置。
+
+        @param user_id: 用户主键 ID
+        @param updates: 待合并更新的偏好字段字典
+        @return: 更新后的完整个人偏好字典
+        @raise AuthError: 用户不存在时抛出
+        """
+        if user_id == 0:
+            return {}
+        async with self._session_factory() as session:
+            async with session.begin():
+                user = await self._user_repo.get_by_id(session, user_id)
+                if user is None:
+                    raise AuthError("not_found", "用户不存在")
+                merged = dict(user.preferences or {})
+                for key, val in updates.items():
+                    if val is None:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = val
+                cleaned = sanitize_user_preferences(merged)
+                user.preferences = cleaned
+                user.updated_at = utc_now()
+
+        logger.info("Updated synced preferences for user id=%d", user_id)
+        return cleaned
+
+    def _resolve_webauthn_context(
+        self,
+        *,
+        passkey_rp_id: str,
+        passkey_rp_name: str,
+        passkey_origin: str,
+        request_origin: str,
+        request_host: str,
+        request_scheme: str,
+    ) -> tuple[str, str, str, list[str]]:
+        """
+        解析并校验 Passkey WebAuthn 的 RP ID、站点展示名称与允许 Origin 列表。
+
+        @param passkey_rp_id: 后台配置的 RP ID（可为空）
+        @param passkey_rp_name: 后台配置的 RP 显示名称
+        @param passkey_origin: 后台配置的允许来源（逗号分隔，可为空）
+        @param request_origin: 浏览器请求的 Origin 请求头
+        @param request_host: 请求 Host 请求头（含可选端口）
+        @param request_scheme: 请求协议（http 或 https）
+        @return: (rp_id, rp_name, primary_origin, expected_origins)
+        @raise AuthError: 来源不匹配或域名为非法裸 IP 时抛出
+        """
+        raw_origin = (request_origin or "").strip().rstrip("/")
+        clean_host = (request_host or "").strip()
+        clean_scheme = (request_scheme or "https").strip().lower() or "https"
+        derived_origin = f"{clean_scheme}://{clean_host}" if clean_host else ""
+
+        configured_origins = [
+            item.strip().rstrip("/")
+            for item in (passkey_origin or "").split(",")
+            if item.strip()
+        ]
+        if configured_origins:
+            if raw_origin and raw_origin not in configured_origins:
+                raise AuthError(
+                    "passkey_origin_mismatch",
+                    f"当前访问来源 ({raw_origin}) 不在 Passkey 允许来源配置中",
+                )
+            primary_origin = raw_origin or configured_origins[0]
+            expected_origins = configured_origins
+        else:
+            primary_origin = raw_origin or derived_origin
+            if not primary_origin:
+                raise AuthError(
+                    "passkey_invalid_rp",
+                    "无法识别当前访问来源，请在「系统设置 -> Passkey」中显式配置允许来源",
+                )
+            expected_origins = [primary_origin]
+
+        parsed_host = (urlsplit(primary_origin).hostname or "").strip().lower()
+        rp_id = (passkey_rp_id or "").strip().lower() or parsed_host
+        if not rp_id:
+            raise AuthError("passkey_invalid_rp", "无法识别有效的 Passkey 域名 (RP ID)")
+
+        try:
+            ipaddress.ip_address(rp_id.strip("[]"))
+        except ValueError:
+            pass
+        else:
+            raise AuthError(
+                "passkey_invalid_rp",
+                "Passkey 需要通过域名（HTTPS）或 localhost 访问，不支持裸 IP 地址",
+            )
+
+        rp_name = (passkey_rp_name or "").strip() or "CCUJailer"
+        return rp_id, rp_name, primary_origin, expected_origins
+
+    async def list_user_passkeys(self, user_id: int) -> list[dict[str, Any]]:
+        """
+        查询当前登录用户已绑定的全部 Passkey 通行密钥列表。
+
+        @param user_id: 用户主键 ID
+        @return: Passkey 摘要字典列表
+        """
+        if user_id == 0:
+            return []
+        async with self._session_factory() as session:
+            rows = await self._user_repo.list_passkeys_by_user(session, user_id)
+        return [_passkey_to_summary(row) for row in rows]
+
+    async def begin_passkey_registration(
+        self,
+        user_id: int,
+        *,
+        request_origin: str,
+        request_host: str,
+        request_scheme: str,
+    ) -> dict[str, Any]:
+        """
+        发起当前用户的 Passkey 注册仪式，生成 CreationOptions 与防重放挑战记录。
+
+        @param user_id: 当前登录用户 ID
+        @param request_origin: 请求 Origin 请求头
+        @param request_host: 请求 Host 请求头
+        @param request_scheme: 请求协议（http/https）
+        @return: {"challenge_id": str, "options": dict}
+        @raise AuthError: Passkey 未启用、管理员令牌账号不支持或域名无效时抛出
+        """
+        if user_id == 0:
+            raise AuthError("invalid_input", "静态 ADMIN_TOKEN 会话不支持绑定 Passkey")
+
+        dynamic = await self._setting_service.get_settings()
+        if not dynamic.passkey_enabled:
+            raise AuthError("forbidden", "管理员当前已关闭 Passkey 通行密钥功能")
+
+        rp_id, rp_name, primary_origin, _ = self._resolve_webauthn_context(
+            passkey_rp_id=dynamic.passkey_rp_id,
+            passkey_rp_name=dynamic.passkey_rp_name,
+            passkey_origin=dynamic.passkey_origin,
+            request_origin=request_origin,
+            request_host=request_host,
+            request_scheme=request_scheme,
+        )
+
+        now = utc_now()
+        expires = now + timedelta(minutes=5)
+        challenge_id = secrets.token_urlsafe(32)
+
+        async with self._session_factory() as session:
+            async with session.begin():
+                user = await self._user_repo.get_by_id(session, user_id)
+                if user is None or not user.is_active:
+                    raise AuthError("not_found", "用户不存在或已禁用")
+
+                existing = await self._user_repo.list_passkeys_by_user(session, user.id)
+                exclude_list = [
+                    PublicKeyCredentialDescriptor(id=base64url_to_bytes(pk.credential_id))
+                    for pk in existing
+                ]
+                options = generate_registration_options(
+                    rp_id=rp_id,
+                    rp_name=rp_name,
+                    user_id=f"ccujailer-user-{user.id}".encode(),
+                    user_name=user.username,
+                    user_display_name=user.display_name or user.username,
+                    exclude_credentials=exclude_list or None,
+                    authenticator_selection=AuthenticatorSelectionCriteria(
+                        resident_key=ResidentKeyRequirement.PREFERRED,
+                        user_verification=UserVerificationRequirement.PREFERRED,
+                    ),
+                )
+                await self._user_repo.delete_expired_webauthn_challenges(session, now)
+                await self._user_repo.add_webauthn_challenge(
+                    session,
+                    WebAuthnChallenge(
+                        id=challenge_id,
+                        purpose="register",
+                        user_id=user.id,
+                        challenge=bytes_to_base64url(options.challenge),
+                        rp_id=rp_id,
+                        origin=primary_origin,
+                        expires_at=expires,
+                        created_at=now,
+                    ),
+                )
+
+        return {
+            "challenge_id": challenge_id,
+            "options": json.loads(options_to_json(options)),
+        }
+
+    async def complete_passkey_registration(
+        self,
+        user_id: int,
+        *,
+        challenge_id: str,
+        credential: dict[str, Any],
+        name: str = "",
+    ) -> dict[str, Any]:
+        """
+        验签并持久化浏览器提交的 Passkey 注册凭据。
+
+        @param user_id: 当前登录用户 ID
+        @param challenge_id: 注册挑战标识 ID
+        @param credential: 浏览器 WebAuthn create() 返回的 JSON 凭据
+        @param name: 设备显示名称
+        @return: 新建 Passkey 摘要字典
+        @raise AuthError: 挑战无效、过期、签名验证失败或凭据重复时抛出
+        """
+        if user_id == 0:
+            raise AuthError("invalid_input", "静态 ADMIN_TOKEN 会话不支持绑定 Passkey")
+
+        dynamic = await self._setting_service.get_settings()
+        if not dynamic.passkey_enabled:
+            raise AuthError("forbidden", "管理员当前已关闭 Passkey 通行密钥功能")
+
+        now = utc_now()
+        async with self._session_factory() as session:
+            async with session.begin():
+                await self._user_repo.delete_expired_webauthn_challenges(session, now)
+                challenge_row = await self._user_repo.pop_webauthn_challenge(session, challenge_id)
+                if (
+                    challenge_row is None
+                    or challenge_row.purpose != "register"
+                    or challenge_row.user_id != user_id
+                    or ensure_utc(challenge_row.expires_at) < now  # type: ignore[operator]
+                ):
+                    raise AuthError("invalid_token", "Passkey 注册挑战已失效或过期，请重新发起")
+
+                user = await self._user_repo.get_by_id(session, user_id)
+                if user is None or not user.is_active:
+                    raise AuthError("not_found", "用户不存在或已禁用")
+
+                configured_origins = [
+                    item.strip().rstrip("/")
+                    for item in (dynamic.passkey_origin or "").split(",")
+                    if item.strip()
+                ]
+                expected_origins = configured_origins or [challenge_row.origin]
+
+                try:
+                    verified = verify_registration_response(
+                        credential=credential,
+                        expected_challenge=base64url_to_bytes(challenge_row.challenge),
+                        expected_rp_id=challenge_row.rp_id,
+                        expected_origin=expected_origins,
+                        require_user_presence=True,
+                        require_user_verification=False,
+                    )
+                except (WebAuthnException, ValueError, TypeError) as exc:
+                    logger.warning(
+                        "Passkey registration verification failed for user id=%d: %s",
+                        user_id,
+                        exc,
+                    )
+                    raise AuthError("invalid_credentials", f"Passkey 校验失败：{exc}") from exc
+
+                cred_id_b64 = bytes_to_base64url(verified.credential_id)
+                if await self._user_repo.get_passkey_by_credential_id(session, cred_id_b64):
+                    raise AuthError("conflict", "该 Passkey 凭据已存在，请勿重复绑定")
+
+                raw_transports = (credential.get("response") or {}).get("transports") or []
+                valid_transports = {t.value for t in AuthenticatorTransport}
+                transports = [
+                    str(t).strip()
+                    for t in raw_transports
+                    if isinstance(t, str) and str(t).strip() in valid_transports
+                ]
+
+                clean_name = name.strip()[:120] or "通行密钥"
+                passkey = UserPasskey(
+                    user_id=user.id,
+                    credential_id=cred_id_b64,
+                    public_key=bytes_to_base64url(verified.credential_public_key),
+                    sign_count=int(verified.sign_count),
+                    name=clean_name,
+                    transports=transports,
+                    backed_up=bool(verified.credential_backed_up),
+                    aaguid=str(verified.aaguid or "")[:64],
+                    created_at=now,
+                )
+                await self._user_repo.add_passkey(session, passkey)
+                summary = _passkey_to_summary(passkey)
+
+        logger.info(
+            "User id=%d registered passkey id=%d ('%s')",
+            user_id,
+            summary["id"],
+            clean_name,
+        )
+        return summary
+
+    async def rename_user_passkey(
+        self,
+        user_id: int,
+        passkey_id: int,
+        name: str,
+    ) -> dict[str, Any]:
+        """
+        重命名当前用户已绑定的 Passkey 设备名称。
+
+        @param user_id: 当前登录用户 ID
+        @param passkey_id: Passkey 主键 ID
+        @param name: 新的设备名称
+        @return: 更新后的 Passkey 摘要字典
+        @raise AuthError: 凭据不存在或无权操作他人凭据时抛出
+        """
+        clean_name = name.strip()[:120]
+        if not clean_name:
+            raise AuthError("invalid_input", "Passkey 名称不能为空")
+
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await self._user_repo.get_passkey_by_id(session, passkey_id)
+                if row is None or row.user_id != user_id:
+                    raise AuthError("not_found", "未找到对应的 Passkey 记录")
+                row.name = clean_name
+                summary = _passkey_to_summary(row)
+
+        return summary
+
+    async def delete_user_passkey(self, user_id: int, passkey_id: int) -> bool:
+        """
+        解绑并删除当前用户指定的 Passkey 凭据。
+
+        @param user_id: 当前登录用户 ID
+        @param passkey_id: Passkey 主键 ID
+        @return: 成功删除返回 True
+        @raise AuthError: 凭据不存在或无权操作时抛出
+        """
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await self._user_repo.get_passkey_by_id(session, passkey_id)
+                if row is None or row.user_id != user_id:
+                    raise AuthError("not_found", "未找到对应的 Passkey 记录")
+                await self._user_repo.delete_passkey(session, row)
+
+        logger.info("User id=%d deleted passkey id=%d", user_id, passkey_id)
+        return True
+
+    async def begin_passkey_login(
+        self,
+        *,
+        username: str = "",
+        request_origin: str,
+        request_host: str,
+        request_scheme: str,
+    ) -> dict[str, Any]:
+        """
+        发起 Passkey 免密或指定用户名登录认证仪式。
+
+        @param username: 可选用户名提示；留空时生成可发现凭据 RequestOptions
+        @param request_origin: 请求 Origin 请求头
+        @param request_host: 请求 Host 请求头
+        @param request_scheme: 请求协议（http/https）
+        @return: {"challenge_id": str, "options": dict}
+        @raise AuthError: 功能未启用、来源非法或指定账号未绑定 Passkey 时抛出
+        """
+        dynamic = await self._setting_service.get_settings()
+        if not dynamic.passkey_enabled:
+            raise AuthError("forbidden", "管理员当前已关闭 Passkey 通行密钥登录")
+
+        rp_id, _, primary_origin, _ = self._resolve_webauthn_context(
+            passkey_rp_id=dynamic.passkey_rp_id,
+            passkey_rp_name=dynamic.passkey_rp_name,
+            passkey_origin=dynamic.passkey_origin,
+            request_origin=request_origin,
+            request_host=request_host,
+            request_scheme=request_scheme,
+        )
+
+        now = utc_now()
+        expires = now + timedelta(minutes=5)
+        challenge_id = secrets.token_urlsafe(32)
+        clean_user = username.strip()
+
+        async with self._session_factory() as session:
+            async with session.begin():
+                allow_list: list[PublicKeyCredentialDescriptor] | None = None
+                target_user_id: int | None = None
+                if clean_user:
+                    user = await self._user_repo.get_by_username(session, clean_user)
+                    if user is None or not user.is_active:
+                        raise AuthError("not_found", "未找到该账号或账号已禁用")
+                    pks = await self._user_repo.list_passkeys_by_user(session, user.id)
+                    if not pks:
+                        raise AuthError("not_found", "该账号尚未绑定任何 Passkey 通行密钥")
+                    allow_list = [
+                        PublicKeyCredentialDescriptor(id=base64url_to_bytes(pk.credential_id))
+                        for pk in pks
+                    ]
+                    target_user_id = user.id
+
+                options = generate_authentication_options(
+                    rp_id=rp_id,
+                    allow_credentials=allow_list,
+                    user_verification=UserVerificationRequirement.PREFERRED,
+                )
+                await self._user_repo.delete_expired_webauthn_challenges(session, now)
+                await self._user_repo.add_webauthn_challenge(
+                    session,
+                    WebAuthnChallenge(
+                        id=challenge_id,
+                        purpose="login",
+                        user_id=target_user_id,
+                        challenge=bytes_to_base64url(options.challenge),
+                        rp_id=rp_id,
+                        origin=primary_origin,
+                        expires_at=expires,
+                        created_at=now,
+                    ),
+                )
+
+        return {
+            "challenge_id": challenge_id,
+            "options": json.loads(options_to_json(options)),
+        }
+
+    async def complete_passkey_login(
+        self,
+        *,
+        challenge_id: str,
+        credential: dict[str, Any],
+    ) -> LoginOutcome:
+        """
+        核验 Passkey 签名断言、更新签名计数器并签发正式系统会话凭据。
+
+        @param challenge_id: 登录挑战标识 ID
+        @param credential: 浏览器 WebAuthn get() 返回的 JSON 凭据
+        @return: 包含 JWT 与用户信息的 LoginOutcome
+        @raise AuthError: 挑战无效、签名校验失败或账号被禁用时抛出
+        """
+        dynamic = await self._setting_service.get_settings()
+        if not dynamic.passkey_enabled:
+            raise AuthError("forbidden", "管理员当前已关闭 Passkey 通行密钥登录")
+
+        raw_cred_id = str(credential.get("id") or "").strip()
+        if not raw_cred_id:
+            raise AuthError("invalid_credentials", "Passkey 响应缺少凭据 ID")
+        try:
+            normalized_cred_id = bytes_to_base64url(base64url_to_bytes(raw_cred_id))
+        except (ValueError, TypeError) as exc:
+            raise AuthError("invalid_credentials", "Passkey 凭据 ID 格式无效") from exc
+
+        now = utc_now()
+        async with self._session_factory() as session:
+            async with session.begin():
+                await self._user_repo.delete_expired_webauthn_challenges(session, now)
+                challenge_row = await self._user_repo.pop_webauthn_challenge(session, challenge_id)
+                if (
+                    challenge_row is None
+                    or challenge_row.purpose != "login"
+                    or ensure_utc(challenge_row.expires_at) < now  # type: ignore[operator]
+                ):
+                    raise AuthError("invalid_token", "Passkey 登录挑战已失效或过期，请重试")
+
+                passkey = await self._user_repo.get_passkey_by_credential_id(
+                    session, normalized_cred_id
+                )
+                if passkey is None:
+                    passkey = await self._user_repo.get_passkey_by_credential_id(
+                        session, raw_cred_id
+                    )
+                if passkey is None:
+                    raise AuthError(
+                        "invalid_credentials",
+                        "未识别的 Passkey 凭据，请先绑定后再登录",
+                    )
+                if challenge_row.user_id is not None and passkey.user_id != challenge_row.user_id:
+                    raise AuthError("invalid_credentials", "Passkey 与所选账号不匹配")
+
+                user = await self._user_repo.get_by_id(session, passkey.user_id)
+                if user is None:
+                    raise AuthError("invalid_credentials", "Passkey 关联账号不存在")
+                if not user.is_active:
+                    raise AuthError("user_disabled", "该账号已被管理员禁用")
+
+                configured_origins = [
+                    item.strip().rstrip("/")
+                    for item in (dynamic.passkey_origin or "").split(",")
+                    if item.strip()
+                ]
+                expected_origins = configured_origins or [challenge_row.origin]
+
+                try:
+                    verified = verify_authentication_response(
+                        credential=credential,
+                        expected_challenge=base64url_to_bytes(challenge_row.challenge),
+                        expected_rp_id=challenge_row.rp_id,
+                        expected_origin=expected_origins,
+                        credential_public_key=base64url_to_bytes(passkey.public_key),
+                        credential_current_sign_count=int(passkey.sign_count),
+                        require_user_verification=False,
+                    )
+                except (WebAuthnException, ValueError, TypeError) as exc:
+                    logger.warning(
+                        "Passkey authentication failed for user '%s': %s",
+                        user.username,
+                        exc,
+                    )
+                    raise AuthError("invalid_credentials", "Passkey 签名校验失败") from exc
+
+                passkey.sign_count = int(verified.new_sign_count)
+                passkey.backed_up = bool(verified.credential_backed_up)
+                passkey.last_used_at = now
+                user.last_login_at = now
+                user.updated_at = now
+
+                pk_counts = await self._user_repo.count_passkeys_by_users(session, [user.id])
+                token, exp = self._issue_session_token(user)
+                principal = _user_to_principal(user, passkey_count=pk_counts.get(user.id, 0))
+
+        logger.info("User '%s' logged in via Passkey", principal.username)
+        return LoginOutcome(
+            mfa_required=False,
+            access_token=token,
+            expires_at=exp,
+            user=principal,
+        )

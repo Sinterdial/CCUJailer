@@ -7,6 +7,7 @@ import {
   formatShipDisplay,
   moneyFromCents,
   notify,
+  updateUserPreferences,
 } from "../composables/useAppStore";
 import type { UpgradePlanResponse } from "../types/api";
 
@@ -51,6 +52,11 @@ const ownedAddTo = ref<number | "">("");
 const ownedPairs = ref<[number, number][]>(loadOwned());
 
 function loadOwned(): [number, number][] {
+  if (appStore.authStatus.authenticated && Array.isArray(appStore.userPreferences.owned_ccus)) {
+    return appStore.userPreferences.owned_ccus.filter(
+      (p): p is [number, number] => Array.isArray(p) && p.length === 2
+    );
+  }
   try {
     const raw = JSON.parse(localStorage.getItem(OWNED_STORAGE_KEY) || "[]");
     return Array.isArray(raw) ? raw.filter((p) => Array.isArray(p) && p.length === 2) : [];
@@ -66,7 +72,19 @@ function saveOwned(next: [number, number][]): void {
   } catch {
     // 忽略本地存储写入异常
   }
+  void updateUserPreferences({ owned_ccus: next }, { immediate: true });
 }
+
+watch(
+  () => appStore.preferencesSyncVersion,
+  () => {
+    if (appStore.authStatus.authenticated && Array.isArray(appStore.userPreferences.owned_ccus)) {
+      ownedPairs.value = appStore.userPreferences.owned_ccus.filter(
+        (p): p is [number, number] => Array.isArray(p) && p.length === 2
+      );
+    }
+  }
+);
 
 const ships = computed<PlanShip[]>(() => {
   if (!planMap.value) {
@@ -327,9 +345,9 @@ onMounted(() => {
     <template v-else-if="planMap">
       <div class="plan-pick">
         <label class="plan-field">
-          <span>我拥有的起始底船</span>
+          <span>我拥有的可升级船</span>
           <select v-model="fromRef">
-            <option value="">请选择起始底船</option>
+            <option value="">请选择可升级船</option>
             <option v-for="s in ships" :key="s.ref" :value="s.ref">
               {{ shipTitle(s) }} ({{ moneyFromCents(s.value) }})
             </option>
@@ -339,7 +357,7 @@ onMounted(() => {
         <label class="plan-field">
           <span>我希望升级至的目标船</span>
           <select v-model="toRef" :disabled="!startShip">
-            <option value="">{{ startShip ? "请选择目标舰船" : "请先选择起始底船" }}</option>
+            <option value="">{{ startShip ? "请选择目标舰船" : "请先选择可升级船" }}</option>
             <template v-if="startShip">
               <optgroup label="当前商店可通达目标">
                 <option
@@ -385,16 +403,16 @@ onMounted(() => {
             </li>
           </ul>
           <p v-else class="muted">
-            如果你在之前大促期间已经购入过部分 CCU，可以添加到这里作为路线规划中的 $0 已知跳板（仅保存在当前浏览器本地）。
+            如果你在之前限时活动期间已经购入过部分 CCU，可以添加到这里作为路线规划中的 $0 已知跳板（已登录账号自动同步至云端与多设备）。
           </p>
 
           <div class="owned-add">
             <select
               v-model="ownedAddFrom"
-              aria-label="已有升级起始船"
+              aria-label="已有升级可升级船"
               @change="ownedAddTo = ''"
             >
-              <option value="">起始船…</option>
+              <option value="">可升级船…</option>
               <option v-for="s in ships" :key="s.ref" :value="s.ref">{{ shipTitle(s) }}</option>
             </select>
             <select v-model="ownedAddTo" aria-label="已有升级目标船" :disabled="!ownedAddFrom">
@@ -516,7 +534,7 @@ onMounted(() => {
         <template v-else-if="planMap.at">
           升级可达图实测自 RSI 升级商店，最近更新于 {{ formatAgo(planMap.at) }}。
         </template>
-        Warbond 升级仅限使用新资金购买，且促销 SKU 可能随时下架，下单前请以 RSI 官网结账金额为准。
+        WBCCU 仅限使用新资金购买，且促销 SKU 可能随时下架，下单前请以 RSI 官网结账金额为准。
       </p>
     </template>
   </div>

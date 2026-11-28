@@ -5,6 +5,7 @@
 所有动态配置键严格来源于 cj.core.config.SystemConfigKey。
 """
 
+import json
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -12,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cj.core.config import (
     DEFAULT_DYNAMIC_SETTINGS,
+    VALID_STORE_FILTER_KEYS,
+    VALID_STORE_SORT_KEYS,
     LanguageMode,
     RegistrationMode,
     Settings,
@@ -36,6 +39,8 @@ class DynamicSettingsSnapshot:
     @ivar catalog_sync_interval_seconds: Ship Matrix 与汉化词典同步周期（秒）
     @ivar i18n_source_url: 远程社区汉化词典源地址
     @ivar default_language: 前端默认船名显示模式（bilingual/zh/en）
+    @ivar default_store_filters: 首页默认开启的筛选键列表（如 ["deals"]）
+    @ivar default_store_sort: 首页默认排序键（如 "price-desc"）
     @ivar log_retention_days: 历史记录自动保留天数（0 表示永久保留）
     @ivar translate_enabled: 是否启用 OpenAI 兼容自动翻译兜底
     @ivar translate_api_base: 翻译接口 Base URL
@@ -48,6 +53,10 @@ class DynamicSettingsSnapshot:
     @ivar sso_scopes: OIDC 授权 Scope 列表
     @ivar sso_auto_register: SSO 首次登录时是否自动创建账号
     @ivar sso_default_role: SSO 自动注册账号的默认角色
+    @ivar passkey_enabled: 是否启用 Passkey 通行密钥登录
+    @ivar passkey_rp_id: Passkey RP ID（留空时自动识别请求域名）
+    @ivar passkey_rp_name: Passkey 站点名称
+    @ivar passkey_origin: Passkey 允许来源 Origin 列表（逗号分隔，留空自动识别）
     @ivar upgrade_planner_enabled: 是否启用升级路线规划（/plan）功能
     """
 
@@ -55,6 +64,8 @@ class DynamicSettingsSnapshot:
     catalog_sync_interval_seconds: int
     i18n_source_url: str
     default_language: LanguageMode
+    default_store_filters: list[str]
+    default_store_sort: str
     log_retention_days: int
     translate_enabled: bool
     translate_api_base: str
@@ -67,6 +78,10 @@ class DynamicSettingsSnapshot:
     sso_scopes: str
     sso_auto_register: bool
     sso_default_role: UserRole
+    passkey_enabled: bool
+    passkey_rp_id: str
+    passkey_rp_name: str
+    passkey_origin: str
     upgrade_planner_enabled: bool
 
 
@@ -139,6 +154,51 @@ def _parse_registration_mode(raw: str | None) -> RegistrationMode:
     return "closed"
 
 
+def parse_store_filters(raw: str | list[str] | None) -> list[str]:
+    """
+    解析并过滤合法的首页默认筛选键列表（去重保序）。
+
+    @param raw: JSON 字符串或筛选键列表
+    @return: 合法筛选键列表
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return []
+    elif isinstance(raw, list):
+        parsed = raw
+    else:
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    valid_set = set(VALID_STORE_FILTER_KEYS)
+    cleaned: list[str] = []
+    for item in parsed:
+        key = str(item).strip()
+        if key in valid_set and key not in cleaned:
+            cleaned.append(key)
+    return cleaned
+
+
+def parse_store_sort(raw: str | None) -> str:
+    """
+    校验并规范化首页默认排序键。
+
+    @param raw: 原始排序字符串
+    @return: 合法排序键，无效时回退至 price-desc
+    """
+    cleaned = (raw or "").strip()
+    if cleaned in VALID_STORE_SORT_KEYS:
+        return cleaned
+    return "price-desc"
+
+
 class SettingService:
     """
     动态系统配置业务编排服务。
@@ -206,6 +266,17 @@ class SettingService:
                 "true" if self._settings.oidc_auto_register else "false"
             )
             merged[SystemConfigKey.SSO_DEFAULT_ROLE.value] = self._settings.oidc_default_role
+            merged[SystemConfigKey.PASSKEY_ENABLED.value] = (
+                "true" if self._settings.passkey_enabled else "false"
+            )
+            if self._settings.passkey_rp_id.strip():
+                merged[SystemConfigKey.PASSKEY_RP_ID.value] = self._settings.passkey_rp_id.strip()
+            if self._settings.passkey_rp_name.strip():
+                merged[SystemConfigKey.PASSKEY_RP_NAME.value] = (
+                    self._settings.passkey_rp_name.strip()
+                )
+            if self._settings.passkey_origin.strip():
+                merged[SystemConfigKey.PASSKEY_ORIGIN.value] = self._settings.passkey_origin.strip()
             merged[SystemConfigKey.UPGRADE_PLANNER_ENABLED.value] = (
                 "true" if self._settings.upgrade_planner_enabled else "false"
             )
@@ -220,6 +291,10 @@ class SettingService:
             ),
             i18n_source_url=(merged.get(SystemConfigKey.I18N_SOURCE_URL) or "").strip(),
             default_language=_parse_language(merged.get(SystemConfigKey.DEFAULT_LANGUAGE)),
+            default_store_filters=parse_store_filters(
+                merged.get(SystemConfigKey.DEFAULT_STORE_FILTERS)
+            ),
+            default_store_sort=parse_store_sort(merged.get(SystemConfigKey.DEFAULT_STORE_SORT)),
             log_retention_days=_parse_int(
                 merged.get(SystemConfigKey.LOG_RETENTION_DAYS), 30, 0, 3650
             ),
@@ -248,6 +323,13 @@ class SettingService:
             ).strip(),
             sso_auto_register=_parse_bool(merged.get(SystemConfigKey.SSO_AUTO_REGISTER), True),
             sso_default_role=_parse_role(merged.get(SystemConfigKey.SSO_DEFAULT_ROLE)),
+            passkey_enabled=_parse_bool(merged.get(SystemConfigKey.PASSKEY_ENABLED), True),
+            passkey_rp_id=(merged.get(SystemConfigKey.PASSKEY_RP_ID) or "").strip().lower(),
+            passkey_rp_name=(
+                merged.get(SystemConfigKey.PASSKEY_RP_NAME)
+                or DEFAULT_DYNAMIC_SETTINGS[SystemConfigKey.PASSKEY_RP_NAME]
+            ).strip(),
+            passkey_origin=(merged.get(SystemConfigKey.PASSKEY_ORIGIN) or "").strip(),
             upgrade_planner_enabled=_parse_bool(
                 merged.get(SystemConfigKey.UPGRADE_PLANNER_ENABLED), False
             ),

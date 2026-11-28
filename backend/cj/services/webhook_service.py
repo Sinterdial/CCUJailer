@@ -174,7 +174,7 @@ def _format_nearest_lines(nearest: list[dict[str, Any]]) -> str:
     @return: 格式化后的多行起始船说明文本
     """
     if not nearest:
-        return "暂无可用起始底船数据"
+        return "暂无可用可升级船数据"
     lines: list[str] = []
     for item in nearest:
         en = item.get("name_en", "")
@@ -225,13 +225,13 @@ def build_webhook_payload(
         wb_badge = f"特殊销售 · {edition_label}" if edition_label else "特殊销售"
     elif event_name == "ccu.price_changed":
         event_badge = "CCU 降价提醒"
-        wb_badge = "Warbond 升级 (WBCCU)" if is_wb else (edition_label or "标准版")
+        wb_badge = "WBCCU" if is_wb else (edition_label or "标准版")
     else:
-        event_badge = "Warbond 升级上架" if is_wb else "新 CCU 上架提醒"
+        event_badge = "WBCCU 上架" if is_wb else "新 CCU 上架提醒"
         if is_wb and is_special:
-            wb_badge = "BIS Warbond 升级"
+            wb_badge = "BIS WBCCU"
         elif is_wb:
-            wb_badge = "Warbond 升级 (WBCCU)"
+            wb_badge = "WBCCU"
         else:
             wb_badge = edition_label or "标准版"
 
@@ -247,7 +247,7 @@ def build_webhook_payload(
 
     # 1. 飞书交互式卡片模板
     if provider == WebhookProviderType.FEISHU:
-        nearest_block = f"\n\n**最近可升级起始船推荐**：\n{nearest_text}" if show_nearest else ""
+        nearest_block = f"\n\n**最近可升级船推荐**：\n{nearest_text}" if show_nearest else ""
         card_body = (
             f"**目标舰船**：{ship_display}\n"
             f"**版本类型**：{wb_badge}\n"
@@ -283,7 +283,7 @@ def build_webhook_payload(
 
     # 2. 企业微信群机器人 Markdown 模板
     if provider == WebhookProviderType.WECOM:
-        nearest_block = f"\n\n**最近可升级起始船**：\n{nearest_text}" if show_nearest else ""
+        nearest_block = f"\n\n**最近可升级船**：\n{nearest_text}" if show_nearest else ""
         md_content = (
             f"### {event_badge}：{ship_display}\n"
             f"> **版本**：{wb_badge}\n"
@@ -312,7 +312,7 @@ def build_webhook_payload(
             {"name": "到期时间", "value": expires_text, "inline": False},
         ]
         if show_nearest:
-            fields.append({"name": "最近可升级起始船", "value": nearest_text, "inline": False})
+            fields.append({"name": "最近可升级船", "value": nearest_text, "inline": False})
         embed: dict[str, Any] = {
             "title": f"{event_badge} · {ship_display}",
             "url": store_url,

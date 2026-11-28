@@ -4,16 +4,17 @@ import { Copy, RefreshCw, Save } from "lucide-vue-next";
 import { apiClient } from "../api/client";
 import {
   ensureWriteAuthorized,
+  isAdminUser,
   notify,
   refreshBootstrapState,
   setLanguageMode,
 } from "../composables/useAppStore";
-import AccountSecurityPanel from "./AccountSecurityPanel.vue";
 import ShipsView from "./ShipsView.vue";
 import UsersManagePanel from "./UsersManagePanel.vue";
 import type { LanguageMode, UserRole } from "../types/api";
+import { STORE_FILTER_META, STORE_SORT_OPTIONS } from "../utils/localization";
 
-export type SettingsSubTab = "general" | "ships" | "sso" | "users" | "security";
+export type SettingsSubTab = "general" | "ships" | "sso" | "users";
 
 const props = defineProps<{
   initialSubTab?: SettingsSubTab;
@@ -38,13 +39,15 @@ const form = reactive({
   scrape_interval_seconds: 300,
   catalog_sync_interval_seconds: 86400,
   default_language: "bilingual" as LanguageMode,
+  default_store_filters: [] as string[],
+  default_store_sort: "price-desc",
   log_retention_days: 30,
   upgrade_planner_enabled: false,
   translate_enabled: false,
   translate_api_base: "https://api.openai.com/v1",
   translate_model: "gpt-4o-mini",
   sso_enabled: false,
-  sso_provider_name: "ZITADEL",
+  sso_provider_name: "OIDC",
   sso_issuer_url: "",
   sso_client_id: "",
   sso_scopes: "openid profile email",
@@ -52,13 +55,26 @@ const form = reactive({
   sso_default_role: "user" as UserRole,
 });
 
-const SUBTABS: { id: SettingsSubTab; label: string }[] = [
-  { id: "general", label: "系统参数" },
-  { id: "ships", label: "舰船词典" },
-  { id: "sso", label: "认证与 SSO" },
-  { id: "users", label: "用户管理" },
-  { id: "security", label: "个人安全" },
-];
+const SUBTABS = computed<{ id: SettingsSubTab; label: string }[]>(() => {
+  const tabs: { id: SettingsSubTab; label: string }[] = [
+    { id: "general", label: "全局设置" },
+    { id: "ships", label: "中文译源" },
+    { id: "sso", label: "OIDC" },
+  ];
+  if (isAdminUser()) {
+    tabs.push({ id: "users", label: "用户管理" });
+  }
+  return tabs;
+});
+
+function toggleDefaultFilterKey(key: string): void {
+  const idx = form.default_store_filters.indexOf(key);
+  if (idx === -1) {
+    form.default_store_filters.push(key);
+  } else {
+    form.default_store_filters.splice(idx, 1);
+  }
+}
 
 watch(
   [() => props.initialSubTab, () => props.subTabRequestKey],
@@ -76,6 +92,8 @@ async function loadSettings(): Promise<void> {
     form.scrape_interval_seconds = cfg.scrape_interval_seconds;
     form.catalog_sync_interval_seconds = cfg.catalog_sync_interval_seconds;
     form.default_language = cfg.default_language;
+    form.default_store_filters = [...(cfg.default_store_filters || [])];
+    form.default_store_sort = cfg.default_store_sort || "price-desc";
     form.log_retention_days = cfg.log_retention_days;
     form.upgrade_planner_enabled = cfg.upgrade_planner_enabled;
     form.translate_enabled = cfg.translate_enabled;
@@ -107,6 +125,8 @@ async function saveSettings(): Promise<void> {
       scrape_interval_seconds: form.scrape_interval_seconds,
       catalog_sync_interval_seconds: form.catalog_sync_interval_seconds,
       default_language: form.default_language,
+      default_store_filters: [...form.default_store_filters],
+      default_store_sort: form.default_store_sort,
       log_retention_days: form.log_retention_days,
       upgrade_planner_enabled: form.upgrade_planner_enabled,
       translate_enabled: form.translate_enabled,
@@ -177,19 +197,22 @@ onMounted(() => {
       </button>
     </div>
 
-    <!-- 1. 系统动态参数 -->
-    <form
-      v-if="activeSubTab === 'general'"
-      class="panel form-stack"
-      @submit.prevent="saveSettings"
-    >
-      <div class="panel-header">
-        <div>
-          <h2 class="panel-title">系统动态参数设置</h2>
-          <p class="panel-sub">
-            保存后写入数据库 <span translate="no">system_settings</span> 表并立即热生效，无需重启容器。
-          </p>
-        </div>
+    <!-- 子页面内容区（支持标签切换动效） -->
+    <Transition name="holo-panel" mode="out-in">
+      <!-- 1. 全局设置 -->
+      <form
+        v-if="activeSubTab === 'general'"
+        key="general"
+        class="panel form-stack"
+        @submit.prevent="saveSettings"
+      >
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">全局设置</h2>
+            <p class="panel-sub">
+              保存后写入数据库 <span translate="no">system_settings</span> 表并立即热生效，无需重启容器。
+            </p>
+          </div>
         <button
           type="button"
           class="navbtn"
@@ -256,12 +279,53 @@ onMounted(() => {
           </label>
         </div>
 
+        <div class="sub-box stack-md">
+          <div class="row-between">
+            <div>
+              <strong style="font-size: 14px">首页（在售舰船）全站默认筛选条件与排序</strong>
+              <p class="panel-sub">
+                当用户尚未自定义个人默认条件或匿名访问时生效。例如勾选「仅 WBCCU」后，打开首页即自动仅展示 WBCCU。
+              </p>
+            </div>
+            <button
+              v-if="form.default_store_filters.length"
+              type="button"
+              class="link"
+              @click="form.default_store_filters = []"
+            >
+              清空默认筛选
+            </button>
+          </div>
+
+          <div class="filter-check-grid" role="group" aria-label="首页默认筛选条件">
+            <button
+              v-for="item in STORE_FILTER_META"
+              :key="item.key"
+              type="button"
+              class="chip"
+              :aria-pressed="form.default_store_filters.includes(item.key)"
+              @click="toggleDefaultFilterKey(item.key)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+
+          <label class="field-label" style="max-width: 320px">
+            首页默认排序方式
+            <select v-model="form.default_store_sort" name="default_store_sort" class="select">
+              <option v-for="opt in STORE_SORT_OPTIONS" :key="opt.key" :value="opt.key">
+                {{ opt.label }}
+              </option>
+            </select>
+          </label>
+        </div>
+
         <div class="sub-box">
           <div class="row-between">
             <div>
               <strong style="font-size: 14px">升级路线规划功能（<span translate="no">/plan</span>）</strong>
               <p class="panel-sub">
-                默认关闭。启用后顶部导航与商店卡片显示「升级路线规划」入口，并在后台自动映射多跳 CCU 路径（远程汉化词典源 URL 已移至「舰船词典」标签页维护）。
+                默认关闭。启用后顶部导航与商店卡片显示「升级路线规划」入口，并在后台自动映射多跳 CCU 路径（远程中文译源 URL 已移至「中文译源」标签页维护）。
               </p>
             </div>
             <label class="inline-check">
@@ -323,17 +387,18 @@ onMounted(() => {
       </template>
     </form>
 
-    <!-- 2. 舰船词典（已从顶部主导航移入系统设置） -->
-    <ShipsView v-else-if="activeSubTab === 'ships'" />
+      <!-- 2. 中文译源（已从顶部主导航移入系统设置） -->
+      <ShipsView v-else-if="activeSubTab === 'ships'" key="ships" />
 
-    <!-- 3. 认证与 ZITADEL OIDC PKCE SSO 设置 -->
-    <form
-      v-else-if="activeSubTab === 'sso'"
-      class="panel form-stack"
-      @submit.prevent="saveSettings"
-    >
+      <!-- 3. OIDC 单点登录与全站访问控制 -->
+      <form
+        v-else-if="activeSubTab === 'sso'"
+        key="sso"
+        class="panel form-stack"
+        @submit.prevent="saveSettings"
+      >
       <div>
-        <h2 class="panel-title">站点访问控制与 SSO（ZITADEL PKCE 无 Secret 模式）</h2>
+        <h2 class="panel-title">站点访问控制与 OIDC 单点登录（PKCE 无 Secret 模式）</h2>
         <p class="panel-sub">
           配置基于 Authorization Code + PKCE (S256) 的公共客户端 OIDC 单点登录（无需 Client Secret），并查看全站强制登录环境变量状态。
         </p>
@@ -356,16 +421,16 @@ onMounted(() => {
 
       <div class="sub-box stack-md">
         <div class="row-between">
-          <strong style="font-size: 14px" translate="no">OIDC Single Sign-On (ZITADEL / OIDC PKCE)</strong>
+          <strong style="font-size: 14px" translate="no">OIDC PKCE Single Sign-On</strong>
           <label class="inline-check">
             <input v-model="form.sso_enabled" type="checkbox" />
-            启用 SSO 登录
+            启用 OIDC 登录
           </label>
         </div>
 
         <div class="form-grid-2">
           <label class="field-label">
-            SSO 按钮展示名称
+            OIDC 登录按钮名称
             <input
               v-model="form.sso_provider_name"
               name="sso_provider_name"
@@ -445,19 +510,18 @@ onMounted(() => {
       <div class="row-end">
         <button type="submit" class="navbtn primary" :disabled="saving">
           <Save :size="14" aria-hidden="true" />
-          {{ saving ? "保存中…" : "保存认证与 SSO 配置" }}
+          {{ saving ? "保存中…" : "保存 OIDC 配置" }}
         </button>
       </div>
     </form>
 
-    <!-- 4. 用户管理 -->
-    <UsersManagePanel
-      v-else-if="activeSubTab === 'users'"
-      :auto-open-create-signal="openCreateUserSignal"
-      @consume-create-signal="emit('consumeCreateUserSignal')"
-    />
-
-    <!-- 5. 个人安全与 OTP -->
-    <AccountSecurityPanel v-else-if="activeSubTab === 'security'" />
+      <!-- 4. 用户管理（严格仅管理员可见与访问） -->
+      <UsersManagePanel
+        v-else-if="activeSubTab === 'users' && isAdminUser()"
+        key="users"
+        :auto-open-create-signal="openCreateUserSignal"
+        @consume-create-signal="emit('consumeCreateUserSignal')"
+      />
+    </Transition>
   </section>
 </template>

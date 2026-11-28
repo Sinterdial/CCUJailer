@@ -2,17 +2,22 @@
 用户管理、本地账密、TOTP 二步验证与 ZITADEL OIDC PKCE 无密钥 SSO 单元测试模块。
 """
 
+import base64
+import hashlib
 import json
+import struct
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import cbor2
 import httpx
 import jwt
 import pyotp
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from sqlalchemy import select
 
 from cj.core.config import Settings
@@ -88,7 +93,10 @@ async def test_bootstrap_admin_totp_and_user_rbac(tmp_path: Path) -> None:
                 headers={"Authorization": f"Bearer {admin_token}"},
             )
             assert enable_res.status_code == 200
-            assert enable_res.json()["totp_enabled"] is True
+            enable_payload = enable_res.json()
+            assert enable_payload["user"]["totp_enabled"] is True
+            assert len(enable_payload["backup_codes"]) == 8
+            assert enable_payload["user"]["totp_backup_codes_remaining"] == 8
 
             # 3. 重新登录应返回 mfa_required=True 与短期挑战令牌
             mfa_step1 = await client.post(
@@ -533,3 +541,463 @@ async def test_registration_modes_and_invite_codes(tmp_path: Path) -> None:
                 json={"username": "late_pilot", "password": "LatePassword123"},
             )
             assert re_closed.status_code == 403
+
+
+def _b64url(data: bytes) -> str:
+    """
+    将字节编码为无填充 Base64URL 字符串。
+
+    @param data: 原始二进制数据
+    @return: Base64URL 字符串
+    """
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _build_virtual_passkey_registration(
+    *,
+    private_key: ec.EllipticCurvePrivateKey,
+    credential_id: bytes,
+    challenge_b64u: str,
+    rp_id: str,
+    origin: str,
+) -> dict[str, Any]:
+    """
+    使用本地 EC P-256 私钥构造符合 W3C WebAuthn 规范的测试注册凭据响应。
+
+    @param private_key: 测试用 EC P-256 私钥
+    @param credential_id: 凭据二进制 ID
+    @param challenge_b64u: 服务端下发的 Base64URL 挑战串
+    @param rp_id: 预期 RP ID
+    @param origin: 预期前端 Origin
+    @return: 可提交至 /api/v1/auth/passkeys/register/verify 的凭据字典
+    """
+    pub_nums = private_key.public_key().public_numbers()
+    cose_key = cbor2.dumps(
+        {
+            1: 2,  # EC2
+            3: -7,  # ES256
+            -1: 1,  # P-256
+            -2: pub_nums.x.to_bytes(32, "big"),
+            -3: pub_nums.y.to_bytes(32, "big"),
+        }
+    )
+    rp_id_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+    flags = bytes([0x45])  # UP | UV | AT
+    sign_count = struct.pack(">I", 0)
+    aaguid = bytes(16)
+    cred_len = struct.pack(">H", len(credential_id))
+    auth_data = rp_id_hash + flags + sign_count + aaguid + cred_len + credential_id + cose_key
+    attestation_obj = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth_data})
+    client_data = json.dumps(
+        {
+            "type": "webauthn.create",
+            "challenge": challenge_b64u,
+            "origin": origin,
+            "crossOrigin": False,
+        }
+    ).encode("utf-8")
+    cred_id_b64 = _b64url(credential_id)
+    return {
+        "id": cred_id_b64,
+        "rawId": cred_id_b64,
+        "type": "public-key",
+        "authenticatorAttachment": "platform",
+        "response": {
+            "clientDataJSON": _b64url(client_data),
+            "attestationObject": _b64url(attestation_obj),
+            "transports": ["internal", "hybrid"],
+        },
+    }
+
+
+def _build_virtual_passkey_assertion(
+    *,
+    private_key: ec.EllipticCurvePrivateKey,
+    credential_id: bytes,
+    challenge_b64u: str,
+    rp_id: str,
+    origin: str,
+    user_handle: bytes,
+    counter: int = 1,
+) -> dict[str, Any]:
+    """
+    使用本地 EC P-256 私钥构造符合 W3C WebAuthn 规范的登录签名断言响应。
+
+    @param private_key: 测试用 EC P-256 私钥
+    @param credential_id: 凭据二进制 ID
+    @param challenge_b64u: 服务端下发的 Base64URL 挑战串
+    @param rp_id: 预期 RP ID
+    @param origin: 预期前端 Origin
+    @param user_handle: 用户句柄字节
+    @param counter: 递增签名计数器
+    @return: 可提交至 /api/v1/auth/passkeys/login/verify 的断言字典
+    """
+    rp_id_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+    auth_data = rp_id_hash + bytes([0x05]) + struct.pack(">I", counter)
+    client_data = json.dumps(
+        {
+            "type": "webauthn.get",
+            "challenge": challenge_b64u,
+            "origin": origin,
+            "crossOrigin": False,
+        }
+    ).encode("utf-8")
+    client_hash = hashlib.sha256(client_data).digest()
+    signature = private_key.sign(auth_data + client_hash, ec.ECDSA(hashes.SHA256()))
+    cred_id_b64 = _b64url(credential_id)
+    return {
+        "id": cred_id_b64,
+        "rawId": cred_id_b64,
+        "type": "public-key",
+        "authenticatorAttachment": "platform",
+        "response": {
+            "authenticatorData": _b64url(auth_data),
+            "clientDataJSON": _b64url(client_data),
+            "signature": _b64url(signature),
+            "userHandle": _b64url(user_handle),
+        },
+    }
+
+
+async def test_user_preferences_cross_device_sync_and_reset(tmp_path: Path) -> None:
+    """
+    验证登录用户个人偏好跨终端同步接口（PUT/GET /api/v1/auth/preferences）及 null 继承重置。
+    """
+    data_dir = tmp_path / "data_prefs"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{(data_dir / 'prefs.db').as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+        enable_scheduler=False,
+        admin_token="",
+        frontend_dist_dir=tmp_path / "no_dist",
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            setup_res = await client.post(
+                "/api/v1/auth/setup",
+                json={"username": "pref_admin", "password": "StrongPassword123"},
+            )
+            assert setup_res.status_code == 201
+            token = setup_res.json()["access_token"]
+            hdrs = {"Authorization": f"Bearer {token}"}
+
+            # 1. 非法默认筛选键返回 422
+            bad_pref = await client.put(
+                "/api/v1/auth/preferences",
+                json={"default_store_filters": ["non_existent_filter"]},
+                headers=hdrs,
+            )
+            assert bad_pref.status_code == 422
+
+            # 2. 保存详情卡片排序、折叠状态、已囤 CCU 与个人默认筛选
+            saved = await client.put(
+                "/api/v1/auth/preferences",
+                json={
+                    "language_mode": "zh",
+                    "theme_mode": "dark",
+                    "auec_rate": 750000,
+                    "details_card_order": ["donors", "ingame", "weapons"],
+                    "details_collapsed_cards": ["history", "cargo"],
+                    "webhook_collapsed_ids": ["rule-1"],
+                    "owned_ccus": [[10, 20], [20, 35]],
+                    "default_store_filters": ["deals", "saleonly"],
+                    "default_store_sort": "released",
+                    "store_page_size": 30,
+                },
+                headers=hdrs,
+            )
+            assert saved.status_code == 200
+            body = saved.json()
+            assert body["language_mode"] == "zh"
+            assert body["default_store_filters"] == ["deals", "saleonly"]
+            assert body["default_store_sort"] == "released"
+            assert body["store_page_size"] == 30
+            assert body["details_collapsed_cards"] == ["history", "cargo"]
+            assert body["owned_ccus"] == [[10, 20], [20, 35]]
+
+            # 3. 局部更新不覆盖其他字段
+            partial = await client.put(
+                "/api/v1/auth/preferences",
+                json={"webhook_card_order": ["rule-2", "rule-1"]},
+                headers=hdrs,
+            )
+            assert partial.status_code == 200
+            assert partial.json()["webhook_card_order"] == ["rule-2", "rule-1"]
+            assert partial.json()["default_store_filters"] == ["deals", "saleonly"]
+            assert partial.json()["store_page_size"] == 30
+
+            # 4. 模拟另一台终端用相同账号登录后请求 /auth/status 和 /auth/me 均拿到完整偏好
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test", headers=hdrs
+            ) as device2:
+                status_d2 = await device2.get("/api/v1/auth/status")
+                assert status_d2.status_code == 200
+                u_prefs = status_d2.json()["user"]["preferences"]
+                assert u_prefs["details_card_order"][:3] == ["donors", "ingame", "weapons"]
+                assert len(u_prefs["details_card_order"]) == 7
+                assert u_prefs["default_store_filters"] == ["deals", "saleonly"]
+                assert u_prefs["auec_rate"] == 750000
+                assert u_prefs["store_page_size"] == 30
+
+                # 5. 传入 null 恢复个人默认筛选跟随系统全局设置，且允许设为 0 表示显示全部
+                reset = await device2.put(
+                    "/api/v1/auth/preferences",
+                    json={
+                        "default_store_filters": None,
+                        "default_store_sort": None,
+                        "store_page_size": 0,
+                    },
+                )
+                assert reset.status_code == 200
+                assert reset.json()["default_store_filters"] is None
+                assert reset.json()["default_store_sort"] is None
+                assert reset.json()["store_page_size"] == 0
+
+
+async def test_totp_backup_codes_login_consumption_and_regenerate(tmp_path: Path) -> None:
+    """
+    验证 TOTP 绑定后生成 8 个一次性备用恢复码、备用码登录单次消费防重放、
+    重新生成备用码作废旧码以及关闭 TOTP 后清空备用码全流程。
+    """
+    data_dir = tmp_path / "data_backup_codes"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{(data_dir / 'backup_codes.db').as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+        enable_scheduler=False,
+        admin_token="",
+        frontend_dist_dir=tmp_path / "no_dist",
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            setup_res = await client.post(
+                "/api/v1/auth/setup",
+                json={"username": "totp_admin", "password": "StrongPassword123"},
+            )
+            assert setup_res.status_code == 201
+            token = setup_res.json()["access_token"]
+            hdrs = {"Authorization": f"Bearer {token}"}
+
+            otp_secret = (await client.post("/api/v1/auth/otp/setup", headers=hdrs)).json()[
+                "secret"
+            ]
+            enable_res = await client.post(
+                "/api/v1/auth/otp/enable",
+                json={"otp_code": pyotp.TOTP(otp_secret).now()},
+                headers=hdrs,
+            )
+            assert enable_res.status_code == 200
+            codes = enable_res.json()["backup_codes"]
+            assert len(codes) == 8
+            assert enable_res.json()["user"]["totp_backup_codes_remaining"] == 8
+
+            # 1. 使用第一个备用恢复码（去掉连字符并转小写验证容错）完成二步登录
+            step1 = (
+                await client.post(
+                    "/api/v1/auth/login",
+                    json={"username": "totp_admin", "password": "StrongPassword123"},
+                )
+            ).json()
+            assert step1["mfa_required"] is True
+            code_0_variant = codes[0].replace("-", "").lower()
+            step2 = await client.post(
+                "/api/v1/auth/login/otp",
+                json={"mfa_token": step1["mfa_token"], "otp_code": code_0_variant},
+            )
+            assert step2.status_code == 200
+            assert step2.json()["user"]["totp_backup_codes_remaining"] == 7
+
+            # 2. 已消费的备用恢复码不能再次使用
+            step1_replay = (
+                await client.post(
+                    "/api/v1/auth/login",
+                    json={"username": "totp_admin", "password": "StrongPassword123"},
+                )
+            ).json()
+            replay_res = await client.post(
+                "/api/v1/auth/login/otp",
+                json={"mfa_token": step1_replay["mfa_token"], "otp_code": codes[0]},
+            )
+            assert replay_res.status_code == 401
+
+            # 3. 重新生成备用恢复码后旧码失效，新码可用
+            regen = await client.post(
+                "/api/v1/auth/otp/backup-codes/regenerate",
+                json={"current_password": "StrongPassword123"},
+                headers=hdrs,
+            )
+            assert regen.status_code == 200
+            new_codes = regen.json()["backup_codes"]
+            assert len(new_codes) == 8
+            assert regen.json()["remaining"] == 8
+
+            old_code_fail = await client.post(
+                "/api/v1/auth/login/otp",
+                json={"mfa_token": step1_replay["mfa_token"], "otp_code": codes[1]},
+            )
+            assert old_code_fail.status_code == 401
+
+            new_code_ok = await client.post(
+                "/api/v1/auth/login/otp",
+                json={"mfa_token": step1_replay["mfa_token"], "otp_code": new_codes[0]},
+            )
+            assert new_code_ok.status_code == 200
+            assert new_code_ok.json()["user"]["totp_backup_codes_remaining"] == 7
+
+            # 4. 关闭 TOTP 后剩余备用恢复码清零
+            disable_res = await client.post(
+                "/api/v1/auth/otp/disable",
+                json={"current_password": "StrongPassword123"},
+                headers=hdrs,
+            )
+            assert disable_res.status_code == 200
+            assert disable_res.json()["totp_enabled"] is False
+            assert disable_res.json()["totp_backup_codes_remaining"] == 0
+
+
+async def test_passkey_webauthn_full_lifecycle(tmp_path: Path) -> None:
+    """
+    验证 Passkey（WebAuthn / FIDO2）完整注册、列表、重命名、免密/指定用户登录、
+    防重放校验及解绑删除全流程。
+    """
+    rp_id = "ccu.example.com"
+    origin = "https://ccu.example.com"
+    data_dir = tmp_path / "data_passkey"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{(data_dir / 'passkey.db').as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+        enable_scheduler=False,
+        admin_token="",
+        passkey_enabled=True,
+        passkey_rp_id=rp_id,
+        passkey_rp_name="CCUJailer Test",
+        passkey_origin=origin,
+        frontend_dist_dir=tmp_path / "no_dist",
+    )
+    app = create_app(settings)
+
+    ec_key = ec.generate_private_key(ec.SECP256R1())
+    cred_id = b"virtual-passkey-cred-001"
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        req_headers = {"Origin": origin, "Host": rp_id}
+        async with httpx.AsyncClient(
+            transport=transport, base_url=origin, headers=req_headers
+        ) as client:
+            setup_res = await client.post(
+                "/api/v1/auth/setup",
+                json={"username": "pilot_pk", "password": "StrongPassword123"},
+            )
+            assert setup_res.status_code == 201
+            admin_token = setup_res.json()["access_token"]
+            user_id = setup_res.json()["user"]["id"]
+            auth_hdrs = {"Authorization": f"Bearer {admin_token}", **req_headers}
+
+            # 1. 发起注册挑战并完成真实验签注册
+            reg_opt_res = await client.post(
+                "/api/v1/auth/passkeys/register/options", headers=auth_hdrs
+            )
+            assert reg_opt_res.status_code == 200
+            reg_challenge = reg_opt_res.json()
+            reg_cred = _build_virtual_passkey_registration(
+                private_key=ec_key,
+                credential_id=cred_id,
+                challenge_b64u=reg_challenge["options"]["challenge"],
+                rp_id=rp_id,
+                origin=origin,
+            )
+            reg_verify = await client.post(
+                "/api/v1/auth/passkeys/register/verify",
+                json={
+                    "challenge_id": reg_challenge["challenge_id"],
+                    "name": "MacBook TouchID",
+                    "credential": reg_cred,
+                },
+                headers=auth_hdrs,
+            )
+            assert reg_verify.status_code == 201
+            pk_id = reg_verify.json()["id"]
+            assert reg_verify.json()["name"] == "MacBook TouchID"
+
+            # 2. 查询列表与重命名
+            listed = (await client.get("/api/v1/auth/passkeys", headers=auth_hdrs)).json()
+            assert listed["total"] == 1
+            renamed = await client.put(
+                f"/api/v1/auth/passkeys/{pk_id}",
+                json={"name": "工作电脑 Hello"},
+                headers=auth_hdrs,
+            )
+            assert renamed.status_code == 200
+            assert renamed.json()["name"] == "工作电脑 Hello"
+
+            # 3. 无用户名提示可发现凭据免密登录（在独立未登录客户端下）
+            async with httpx.AsyncClient(
+                transport=transport, base_url=origin, headers=req_headers
+            ) as anon_cli:
+                login_opt = await anon_cli.post("/api/v1/auth/passkeys/login/options", json={})
+                assert login_opt.status_code == 200
+                login_ch = login_opt.json()
+                assertion = _build_virtual_passkey_assertion(
+                    private_key=ec_key,
+                    credential_id=cred_id,
+                    challenge_b64u=login_ch["options"]["challenge"],
+                    rp_id=rp_id,
+                    origin=origin,
+                    user_handle=str(user_id).encode("utf-8"),
+                    counter=1,
+                )
+                login_ok = await anon_cli.post(
+                    "/api/v1/auth/passkeys/login/verify",
+                    json={"challenge_id": login_ch["challenge_id"], "credential": assertion},
+                )
+                assert login_ok.status_code == 200
+                assert login_ok.json()["user"]["username"] == "pilot_pk"
+                assert login_ok.json()["user"]["passkey_count"] == 1
+
+                # 相同挑战重放必须失败
+                replay = await anon_cli.post(
+                    "/api/v1/auth/passkeys/login/verify",
+                    json={"challenge_id": login_ch["challenge_id"], "credential": assertion},
+                )
+                assert replay.status_code == 401
+
+                # 指定用户名登录同样成功（sign_count 递增）
+                hint_opt = await anon_cli.post(
+                    "/api/v1/auth/passkeys/login/options",
+                    json={"username": "pilot_pk"},
+                )
+                assert hint_opt.status_code == 200
+                hint_ch = hint_opt.json()
+                assert len(hint_ch["options"]["allowCredentials"]) == 1
+                hint_assert = _build_virtual_passkey_assertion(
+                    private_key=ec_key,
+                    credential_id=cred_id,
+                    challenge_b64u=hint_ch["options"]["challenge"],
+                    rp_id=rp_id,
+                    origin=origin,
+                    user_handle=str(user_id).encode("utf-8"),
+                    counter=2,
+                )
+                hint_ok = await anon_cli.post(
+                    "/api/v1/auth/passkeys/login/verify",
+                    json={"challenge_id": hint_ch["challenge_id"], "credential": hint_assert},
+                )
+                assert hint_ok.status_code == 200
+
+            # 4. 删除 Passkey 后无法再使用该凭据登录
+            del_res = await client.delete(f"/api/v1/auth/passkeys/{pk_id}", headers=auth_hdrs)
+            assert del_res.status_code == 200
+            after_del_list = (await client.get("/api/v1/auth/passkeys", headers=auth_hdrs)).json()
+            assert after_del_list["total"] == 0

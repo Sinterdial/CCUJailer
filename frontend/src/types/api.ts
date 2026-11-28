@@ -1,5 +1,7 @@
 export type LanguageMode = "bilingual" | "zh" | "en";
 
+export type ThemeMode = "system" | "light" | "dark";
+
 export type UserRole = "admin" | "user";
 
 export type RegistrationMode = "open" | "invite_only" | "closed";
@@ -7,6 +9,39 @@ export type RegistrationMode = "open" | "invite_only" | "closed";
 export type WebhookProviderType = "generic" | "feishu" | "wecom" | "discord" | "custom";
 
 export type WebhookMethod = "POST" | "PUT" | "PATCH";
+
+export interface UserPreferences {
+  language_mode?: LanguageMode | null;
+  theme_mode?: ThemeMode | null;
+  auec_rate?: number | null;
+  details_card_order?: string[] | null;
+  details_collapsed_cards?: string[] | null;
+  webhook_card_order?: string[] | null;
+  webhook_collapsed_ids?: string[] | null;
+  owned_ccus?: [number, number][] | null;
+  default_store_filters?: string[] | null;
+  default_store_sort?: string | null;
+  store_page_size?: number | null;
+}
+
+export interface PasskeyItem {
+  id: number;
+  name: string;
+  transports: string[];
+  backed_up: boolean;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+export interface PasskeyListResponse {
+  items: PasskeyItem[];
+  total: number;
+}
+
+export interface PasskeyChallengeResponse {
+  challenge_id: string;
+  options: Record<string, unknown>;
+}
 
 export interface AuthUser {
   id: number;
@@ -16,8 +51,11 @@ export interface AuthUser {
   role: UserRole;
   is_active: boolean;
   totp_enabled: boolean;
+  totp_backup_codes_remaining?: number;
   has_password: boolean;
   oidc_bound: boolean;
+  passkey_count: number;
+  preferences?: UserPreferences;
   last_login_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -30,6 +68,9 @@ export interface AuthStatus {
   authenticated: boolean;
   sso_enabled: boolean;
   sso_provider_name: string;
+  passkey_enabled: boolean;
+  default_store_filters: string[];
+  default_store_sort: string;
   upgrade_planner_enabled: boolean;
   app_version: string;
   github_url: string;
@@ -48,6 +89,16 @@ export interface TotpSetupResponse {
   secret: string;
   otpauth_uri: string;
   qr_svg: string;
+}
+
+export interface TotpEnableResponse {
+  user: AuthUser;
+  backup_codes: string[];
+}
+
+export interface TotpBackupCodesResponse {
+  backup_codes: string[];
+  remaining: number;
 }
 
 export interface SsoAuthorizeResponse {
@@ -415,6 +466,8 @@ export interface DynamicSettings {
   catalog_sync_interval_seconds: number;
   i18n_source_url: string;
   default_language: LanguageMode;
+  default_store_filters: string[];
+  default_store_sort: string;
   log_retention_days: number;
   translate_enabled: boolean;
   translate_api_base: string;
@@ -429,6 +482,10 @@ export interface DynamicSettings {
   sso_scopes: string;
   sso_auto_register: boolean;
   sso_default_role: UserRole;
+  passkey_enabled: boolean;
+  passkey_rp_id: string;
+  passkey_rp_name: string;
+  passkey_origin: string;
   upgrade_planner_enabled: boolean;
 }
 
@@ -437,6 +494,8 @@ export interface DynamicSettingsUpdatePayload {
   catalog_sync_interval_seconds?: number;
   i18n_source_url?: string;
   default_language?: LanguageMode;
+  default_store_filters?: string[];
+  default_store_sort?: string;
   log_retention_days?: number;
   translate_enabled?: boolean;
   translate_api_base?: string;
@@ -449,5 +508,9 @@ export interface DynamicSettingsUpdatePayload {
   sso_scopes?: string;
   sso_auto_register?: boolean;
   sso_default_role?: UserRole;
+  passkey_enabled?: boolean;
+  passkey_rp_id?: string;
+  passkey_rp_name?: string;
+  passkey_origin?: string;
   upgrade_planner_enabled?: boolean;
 }

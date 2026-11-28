@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   ChevronDown,
+  Fingerprint,
   KeyRound,
   LogOut,
   Monitor,
@@ -11,6 +12,7 @@ import {
   Shield,
   Sun,
   UserCheck,
+  UserCog,
   UserPlus,
   X,
 } from "lucide-vue-next";
@@ -38,10 +40,21 @@ import {
   type ThemeMode,
 } from "./composables/useAppStore";
 import type { LanguageMode } from "./types/api";
+import { getPasskeyAssertion, isPasskeyOriginUsable } from "./utils/webauthn";
 
-type TabId = "store" | "all" | "changes" | "plan" | "webhooks" | "settings" | "security";
+type TabId = "store" | "all" | "changes" | "plan" | "webhooks" | "settings" | "account";
 
 const activeTab = ref<TabId>("store");
+const activeStoreViewMode = ref<"store" | "all">("store");
+const tabScrollPositions = reactive<Record<TabId, number>>({
+  store: 0,
+  all: 0,
+  changes: 0,
+  plan: 0,
+  webhooks: 0,
+  settings: 0,
+  account: 0,
+});
 const refreshing = ref(false);
 const planFromKey = ref("");
 const planToRef = ref<number | null>(null);
@@ -103,7 +116,7 @@ const plannerEnabled = computed(() => Boolean(appStore.authStatus.upgrade_planne
 
 watch(plannerEnabled, (enabled) => {
   if (!enabled && activeTab.value === "plan") {
-    activeTab.value = "store";
+    switchTab("store");
   }
 });
 
@@ -117,13 +130,26 @@ const visibleTabs = computed<{ id: TabId; label: string }[]>(() => {
     tabs.push({ id: "plan", label: "升级路线规划" });
   }
   if (isAdminUser()) {
-    tabs.push({ id: "webhooks", label: "Webhook 规则" });
+    tabs.push({ id: "webhooks", label: "推送设置" });
     tabs.push({ id: "settings", label: "系统设置" });
-  } else if (appStore.authStatus.authenticated) {
-    tabs.push({ id: "security", label: "账号安全" });
   }
   return tabs;
 });
+
+function switchTab(nextTab: TabId): void {
+  const prevTab = activeTab.value;
+  tabScrollPositions[prevTab] = window.scrollY;
+  if (nextTab === "store" || nextTab === "all") {
+    activeStoreViewMode.value = nextTab;
+  }
+  activeTab.value = nextTab;
+  const restoreY = tabScrollPositions[nextTab] || 0;
+  void nextTick(() => {
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: restoreY, behavior: "auto" });
+    });
+  });
+}
 
 async function handleManualRefresh(): Promise<void> {
   if (!ensureWriteAuthorized()) {
@@ -154,7 +180,7 @@ function handleOpenPlan(payload: { fromKey: string; toRef: number }): void {
   }
   planFromKey.value = payload.fromKey;
   planToRef.value = payload.toRef;
-  activeTab.value = "plan";
+  switchTab("plan");
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -168,15 +194,20 @@ function handleThemeChange(event: Event): void {
   setThemeMode(value);
 }
 
+function openAccountSettings(): void {
+  accountMenuOpen.value = false;
+  switchTab("account");
+}
+
 function openSettingsSection(subTab: SettingsSubTab, openCreateUser = false): void {
   accountMenuOpen.value = false;
   if (!isAdminUser()) {
-    activeTab.value = "security";
+    switchTab("account");
     return;
   }
   settingsSubTab.value = subTab;
   settingsSubTabKey.value += 1;
-  activeTab.value = "settings";
+  switchTab("settings");
   if (openCreateUser) {
     createUserSignal.value += 1;
   }
@@ -215,7 +246,7 @@ async function submitSwitchAccount(): Promise<void> {
     await applySessionLogin(res.access_token);
     closeSwitchModal();
     if (!isAdminUser() && (activeTab.value === "settings" || activeTab.value === "webhooks")) {
-      activeTab.value = "store";
+      switchTab("store");
     }
     notify(
       `已切换至账号「${appStore.authStatus.user?.username || switchForm.username.trim()}」`,
@@ -241,7 +272,7 @@ async function submitSwitchOtp(): Promise<void> {
     await applySessionLogin(res.access_token);
     closeSwitchModal();
     if (!isAdminUser() && (activeTab.value === "settings" || activeTab.value === "webhooks")) {
-      activeTab.value = "store";
+      switchTab("store");
     }
     notify(`已切换至账号「${appStore.authStatus.user?.username || ""}」`, "success");
   } catch (err) {
@@ -263,6 +294,41 @@ async function startSwitchSso(): Promise<void> {
     const msg = err instanceof Error ? err.message : "启动 SSO 登录失败";
     switchError.value = msg;
     notify(msg, "error");
+  }
+}
+
+const passkeySwitchUsable = computed(
+  () => appStore.authStatus.passkey_enabled && isPasskeyOriginUsable().ok
+);
+
+async function startSwitchPasskey(): Promise<void> {
+  switchError.value = "";
+  const originCheck = isPasskeyOriginUsable();
+  if (!originCheck.ok) {
+    switchError.value = originCheck.reason;
+    notify(originCheck.reason, "error");
+    return;
+  }
+  switchSubmitting.value = true;
+  try {
+    const challenge = await apiClient.beginPasskeyLogin(switchForm.username.trim());
+    const credential = await getPasskeyAssertion(challenge.options);
+    const res = await apiClient.verifyPasskeyLogin({
+      challenge_id: challenge.challenge_id,
+      credential,
+    });
+    await applySessionLogin(res.access_token);
+    closeSwitchModal();
+    if (!isAdminUser() && (activeTab.value === "settings" || activeTab.value === "webhooks")) {
+      activeTab.value = "store";
+    }
+    notify(`已通过 Passkey 切换至账号「${appStore.authStatus.user?.username || ""}」`, "success");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Passkey 切换账号失败";
+    switchError.value = msg;
+    notify(msg, "error");
+  } finally {
+    switchSubmitting.value = false;
   }
 }
 
@@ -444,59 +510,61 @@ onUnmounted(() => {
               <ChevronDown :size="13" aria-hidden="true" />
             </button>
 
-            <div v-if="accountMenuOpen" class="account-popover" role="menu" aria-label="账号操作菜单">
-              <div class="account-meta">
-                <strong>{{ appStore.authStatus.user.display_name || appStore.authStatus.user.username }}</strong>
-                <span>@{{ appStore.authStatus.user.username }} · {{ isAdminUser() ? "管理员" : "普通用户" }}</span>
+            <Transition name="holo-pop">
+              <div v-if="accountMenuOpen" class="account-popover" role="menu" aria-label="账号操作菜单">
+                <div class="account-meta">
+                  <strong>{{ appStore.authStatus.user.display_name || appStore.authStatus.user.username }}</strong>
+                  <span>@{{ appStore.authStatus.user.username }} · {{ isAdminUser() ? "管理员" : "普通用户" }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="account-item"
+                  role="menuitem"
+                  @click="openSwitchAccountModal"
+                >
+                  <UserCheck :size="14" aria-hidden="true" />
+                  切换账号
+                </button>
+                <button
+                  v-if="isAdminUser()"
+                  type="button"
+                  class="account-item"
+                  role="menuitem"
+                  @click="openSettingsSection('users', true)"
+                >
+                  <UserPlus :size="14" aria-hidden="true" />
+                  添加账号
+                </button>
+                <button
+                  type="button"
+                  class="account-item"
+                  role="menuitem"
+                  @click="openAccountSettings"
+                >
+                  <KeyRound :size="14" aria-hidden="true" />
+                  账户设置
+                </button>
+                <button
+                  v-if="isAdminUser()"
+                  type="button"
+                  class="account-item"
+                  role="menuitem"
+                  @click="openSettingsSection('general')"
+                >
+                  <Settings :size="14" aria-hidden="true" />
+                  系统设置
+                </button>
+                <button
+                  type="button"
+                  class="account-item danger"
+                  role="menuitem"
+                  @click="handleLogout"
+                >
+                  <LogOut :size="14" aria-hidden="true" />
+                  退出登录
+                </button>
               </div>
-              <button
-                type="button"
-                class="account-item"
-                role="menuitem"
-                @click="openSwitchAccountModal"
-              >
-                <UserCheck :size="14" aria-hidden="true" />
-                切换账号
-              </button>
-              <button
-                v-if="isAdminUser()"
-                type="button"
-                class="account-item"
-                role="menuitem"
-                @click="openSettingsSection('users', true)"
-              >
-                <UserPlus :size="14" aria-hidden="true" />
-                添加账号
-              </button>
-              <button
-                type="button"
-                class="account-item"
-                role="menuitem"
-                @click="openSettingsSection('security')"
-              >
-                <KeyRound :size="14" aria-hidden="true" />
-                个人安全与 OTP
-              </button>
-              <button
-                v-if="isAdminUser()"
-                type="button"
-                class="account-item"
-                role="menuitem"
-                @click="openSettingsSection('general')"
-              >
-                <Settings :size="14" aria-hidden="true" />
-                系统设置
-              </button>
-              <button
-                type="button"
-                class="account-item danger"
-                role="menuitem"
-                @click="handleLogout"
-              >
-                <LogOut :size="14" aria-hidden="true" />
-                退出登录
-              </button>
-            </div>
+            </Transition>
           </div>
 
           <button
@@ -530,142 +598,165 @@ onUnmounted(() => {
 
       <section v-else class="lede">
         <h1>
-          <b>{{ inStoreCount }} 艘舰船</b>在售。
-          <span>
-            其中 {{ ledeStats.warbondCount }} 款单船含 <span translate="no">Warbond</span> 版本，{{ ledeStats.tenYearCount }} 款含 <span translate="no">10 Year</span> 版本，{{ ledeStats.ccuWarbondCount }} 个 <span translate="no">WBCCU</span>（Warbond 升级特惠）<template v-if="ledeStats.discountedCount">，{{ ledeStats.discountedCount }} 款单船直降</template><template v-if="ledeStats.limitedCount">，{{ ledeStats.limitedCount }} 款限量</template>。
-          </span>
+          <b>{{ inStoreCount }} 艘舰船</b>在售。<span>其中 {{ ledeStats.warbondCount }} 款单船含 <span translate="no">Warbond</span> 版本，{{ ledeStats.tenYearCount }} 款含 <span translate="no">10 Year</span> 版本，{{ ledeStats.ccuWarbondCount }} 个 <span translate="no">WBCCU</span><template v-if="ledeStats.discountedCount">，{{ ledeStats.discountedCount }} 款单船直降</template><template v-if="ledeStats.limitedCount">，{{ ledeStats.limitedCount }} 款限量</template>。</span>
         </h1>
       </section>
 
-      <!-- 主导航标签栏（舰船词典已移入「系统设置」） -->
+      <!-- 主导航标签栏（个人账户设置位于右侧独立分区） -->
       <nav class="tabs" aria-label="视图切换">
         <button
           v-for="tab in visibleTabs"
           :key="tab.id"
           type="button"
           :aria-pressed="activeTab === tab.id"
-          @click="activeTab = tab.id"
+          @click="switchTab(tab.id)"
         >
           {{ tab.label }}
+        </button>
+        <button
+          v-if="appStore.authStatus.authenticated"
+          type="button"
+          class="tab-account"
+          :aria-pressed="activeTab === 'account'"
+          @click="switchTab('account')"
+        >
+          <UserCog :size="14" aria-hidden="true" />
+          账户设置
         </button>
       </nav>
 
       <main id="main-content" tabindex="-1">
         <StoreView
-          v-if="activeTab === 'store' || activeTab === 'all'"
-          :view-mode="activeTab"
+          v-show="activeTab === 'store' || activeTab === 'all'"
+          :view-mode="activeStoreViewMode"
           @plan-route="handleOpenPlan"
         />
-        <ChangelogView v-else-if="activeTab === 'changes'" />
-        <UpgradePlannerView
-          v-else-if="plannerEnabled && activeTab === 'plan'"
-          :initial-from-key="planFromKey"
-          :initial-to-ref="planToRef"
-        />
-        <WebhooksView v-else-if="activeTab === 'webhooks' && isAdminUser()" />
-        <SettingsView
-          v-else-if="activeTab === 'settings' && isAdminUser()"
-          :initial-sub-tab="settingsSubTab"
-          :sub-tab-request-key="settingsSubTabKey"
-          :open-create-user-signal="createUserSignal"
-          @consume-create-user-signal="createUserSignal = 0"
-        />
-        <AccountSecurityPanel v-else-if="activeTab === 'security'" />
+        <Transition name="holo-panel" mode="out-in">
+          <ChangelogView v-if="activeTab === 'changes'" key="changes" />
+          <UpgradePlannerView
+            v-else-if="plannerEnabled && activeTab === 'plan'"
+            key="plan"
+            :initial-from-key="planFromKey"
+            :initial-to-ref="planToRef"
+          />
+          <WebhooksView v-else-if="activeTab === 'webhooks' && isAdminUser()" key="webhooks" />
+          <SettingsView
+            v-else-if="activeTab === 'settings' && isAdminUser()"
+            key="settings"
+            :initial-sub-tab="settingsSubTab"
+            :sub-tab-request-key="settingsSubTabKey"
+            :open-create-user-signal="createUserSignal"
+            @consume-create-user-signal="createUserSignal = 0"
+          />
+          <AccountSecurityPanel v-else-if="activeTab === 'account'" key="account" />
+        </Transition>
       </main>
     </template>
 
     <!-- 切换账号弹窗（支持密码、OTP 与 ZITADEL PKCE SSO） -->
-    <div v-if="switchModalOpen" class="modal-backdrop" @click.self="closeSwitchModal">
-      <div
-        class="modal-card compact"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="switch-account-title"
-      >
-        <div class="modal-head">
-          <h3 id="switch-account-title">切换登录账号</h3>
-          <button
-            type="button"
-            class="navbtn btn-icon"
-            aria-label="关闭切换账号弹窗"
-            @click="closeSwitchModal"
-          >
-            <X :size="15" aria-hidden="true" />
-          </button>
+    <Transition name="holo-modal">
+      <div v-if="switchModalOpen" class="modal-backdrop" @click.self="closeSwitchModal">
+        <div
+          class="modal-card compact"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="switch-account-title"
+        >
+          <div class="modal-head">
+            <h3 id="switch-account-title">切换登录账号</h3>
+            <button
+              type="button"
+              class="navbtn btn-icon"
+              aria-label="关闭切换账号弹窗"
+              @click="closeSwitchModal"
+            >
+              <X :size="15" aria-hidden="true" />
+            </button>
+          </div>
+
+          <form v-if="!switchMfaToken" class="form-stack" @submit.prevent="submitSwitchAccount">
+            <p v-if="appStore.authStatus.user" class="muted" style="margin: 0; font-size: 13px">
+              当前账号：<b>{{ appStore.authStatus.user.username }}</b>，输入目标账号凭据即可直接切换。
+            </p>
+            <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
+            <label class="field-label">
+              目标用户名或邮箱
+              <input
+                v-model="switchForm.username"
+                name="switch_username"
+                required
+                autocomplete="username"
+                spellcheck="false"
+                placeholder="输入用户名或邮箱…"
+                class="input"
+              />
+            </label>
+            <label class="field-label">
+              登录密码
+              <input
+                v-model="switchForm.password"
+                name="switch_password"
+                type="password"
+                required
+                autocomplete="current-password"
+                class="input"
+              />
+            </label>
+            <div class="modal-foot">
+              <button type="button" class="navbtn" @click="closeSwitchModal">取消</button>
+              <button type="submit" class="navbtn primary" :disabled="switchSubmitting">
+                {{ switchSubmitting ? "切换中…" : "确认切换" }}
+              </button>
+            </div>
+            <div v-if="appStore.authStatus.sso_enabled || passkeySwitchUsable" class="auth-divider"><span>或</span></div>
+            <button
+              v-if="passkeySwitchUsable"
+              type="button"
+              class="navbtn btn-full"
+              :disabled="switchSubmitting"
+              @click="startSwitchPasskey"
+            >
+              <Fingerprint :size="15" aria-hidden="true" />
+              使用 Passkey 通行密钥切换
+            </button>
+            <button
+              v-if="appStore.authStatus.sso_enabled"
+              type="button"
+              class="navbtn btn-full"
+              @click="startSwitchSso"
+            >
+              使用 {{ appStore.authStatus.sso_provider_name || "OIDC" }} 登录切换
+            </button>
+          </form>
+
+          <form v-else class="form-stack" @submit.prevent="submitSwitchOtp">
+            <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
+            <p class="muted" style="margin: 0; font-size: 13px">
+              目标账号已启用二步验证，请输入 6 位 OTP 动态口令或 8 位备用恢复码。
+            </p>
+            <label class="field-label">
+              OTP 动态口令 / 备用恢复码
+              <input
+                v-model="switchForm.otpCode"
+                name="switch_otp_code"
+                required
+                autocomplete="one-time-code"
+                spellcheck="false"
+                maxlength="20"
+                placeholder="6 位数字或 XXXX-XXXX"
+                class="input mono"
+              />
+            </label>
+            <div class="modal-foot">
+              <button type="button" class="navbtn" @click="switchMfaToken = ''">返回上一步</button>
+              <button type="submit" class="navbtn primary" :disabled="switchSubmitting">
+                {{ switchSubmitting ? "验证中…" : "验证并切换" }}
+              </button>
+            </div>
+          </form>
         </div>
-
-        <form v-if="!switchMfaToken" class="form-stack" @submit.prevent="submitSwitchAccount">
-          <p v-if="appStore.authStatus.user" class="muted" style="margin: 0; font-size: 13px">
-            当前账号：<b>{{ appStore.authStatus.user.username }}</b>，输入目标账号凭据即可直接切换。
-          </p>
-          <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
-          <label class="field-label">
-            目标用户名或邮箱
-            <input
-              v-model="switchForm.username"
-              name="switch_username"
-              required
-              autocomplete="username"
-              spellcheck="false"
-              placeholder="输入用户名或邮箱…"
-              class="input"
-            />
-          </label>
-          <label class="field-label">
-            登录密码
-            <input
-              v-model="switchForm.password"
-              name="switch_password"
-              type="password"
-              required
-              autocomplete="current-password"
-              class="input"
-            />
-          </label>
-          <div class="modal-foot">
-            <button type="button" class="navbtn" @click="closeSwitchModal">取消</button>
-            <button type="submit" class="navbtn primary" :disabled="switchSubmitting">
-              {{ switchSubmitting ? "切换中…" : "确认切换" }}
-            </button>
-          </div>
-          <div v-if="appStore.authStatus.sso_enabled" class="auth-divider"><span>或</span></div>
-          <button
-            v-if="appStore.authStatus.sso_enabled"
-            type="button"
-            class="navbtn btn-full"
-            @click="startSwitchSso"
-          >
-            使用 {{ appStore.authStatus.sso_provider_name || "ZITADEL" }} SSO 切换
-          </button>
-        </form>
-
-        <form v-else class="form-stack" @submit.prevent="submitSwitchOtp">
-          <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
-          <p class="muted" style="margin: 0; font-size: 13px">
-            目标账号已启用二步验证，请输入 6 位 OTP 动态口令。
-          </p>
-          <label class="field-label">
-            OTP 动态口令
-            <input
-              v-model="switchForm.otpCode"
-              name="switch_otp_code"
-              required
-              inputmode="numeric"
-              autocomplete="one-time-code"
-              maxlength="8"
-              placeholder="6 位数字"
-              class="input mono"
-            />
-          </label>
-          <div class="modal-foot">
-            <button type="button" class="navbtn" @click="switchMfaToken = ''">返回上一步</button>
-            <button type="submit" class="navbtn primary" :disabled="switchSubmitting">
-              {{ switchSubmitting ? "验证中…" : "验证并切换" }}
-            </button>
-          </div>
-        </form>
       </div>
-    </div>
+    </Transition>
 
     <footer>
       <p>
@@ -683,7 +774,14 @@ onUnmounted(() => {
     </footer>
 
     <!-- 全局轻提示 -->
-    <div class="toast-stack" role="status" aria-live="polite" aria-atomic="false">
+    <TransitionGroup
+      name="holo-toast"
+      tag="div"
+      class="toast-stack"
+      role="status"
+      aria-live="polite"
+      aria-atomic="false"
+    >
       <div
         v-for="toast in appStore.toasts"
         :key="toast.id"
@@ -700,6 +798,6 @@ onUnmounted(() => {
           <X :size="14" aria-hidden="true" />
         </button>
       </div>
-    </div>
+    </TransitionGroup>
   </div>
 </template>

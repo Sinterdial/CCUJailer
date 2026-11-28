@@ -50,8 +50,21 @@ class ChangelogRepository:
 
         if event_type and event_type.strip():
             ev = event_type.strip()
-            base = base.where(Changelog.event_type == ev)
-            count_stmt = count_stmt.where(Changelog.event_type == ev)
+            if ev == "ccu.wb_delisted":
+                cond_ev = (Changelog.event_type == "ccu.delisted") & (
+                    Changelog.is_warbond.is_(True)
+                )
+                base = base.where(cond_ev)
+                count_stmt = count_stmt.where(cond_ev)
+            elif ev == "ccu.standard_delisted":
+                cond_ev = (Changelog.event_type == "ccu.delisted") & (
+                    Changelog.is_warbond.is_(False)
+                )
+                base = base.where(cond_ev)
+                count_stmt = count_stmt.where(cond_ev)
+            else:
+                base = base.where(Changelog.event_type == ev)
+                count_stmt = count_stmt.where(Changelog.event_type == ev)
 
         if query and query.strip():
             pattern = f"%{query.strip().lower()}%"

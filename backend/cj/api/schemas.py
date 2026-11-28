@@ -10,6 +10,214 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from cj import APP_VERSION, GITHUB_REPO_URL
+from cj.core.config import VALID_STORE_FILTER_KEYS, VALID_STORE_SORT_KEYS
+
+
+class UserPreferencesSchema(BaseModel):
+    """
+    已登录用户跨设备同步的个人网站偏好配置模型。
+    """
+
+    language_mode: Literal["bilingual", "zh", "en"] | None = Field(
+        default=None, description="船名及厂商显示语言偏好"
+    )
+    theme_mode: Literal["system", "light", "dark"] | None = Field(
+        default=None, description="界面外观主题偏好"
+    )
+    auec_rate: int | None = Field(
+        default=None, ge=1000, le=100000000, description="每小时预估游戏内收入（aUEC/h）"
+    )
+    details_card_order: list[str] | None = Field(
+        default=None, description="舰船详情弹窗信息卡片自定义排序"
+    )
+    details_collapsed_cards: list[str] | None = Field(
+        default=None, description="舰船详情弹窗默认折叠的信息卡片列表"
+    )
+    webhook_card_order: list[str] | None = Field(
+        default=None, description="推送渠道设置页卡片自定义排序"
+    )
+    webhook_collapsed_ids: list[str] | None = Field(
+        default=None, description="推送渠道设置页默认折叠的规则 ID 列表"
+    )
+    owned_ccus: list[list[int]] | None = Field(
+        default=None, description="升级路线规划器中已提前囤好的 CCU [from_ref, to_ref] 列表"
+    )
+    default_store_filters: list[str] | None = Field(
+        default=None,
+        description="个人首页默认筛选键列表（null 表示跟随系统全局默认设置）",
+    )
+    default_store_sort: str | None = Field(
+        default=None,
+        description="个人首页默认排序键（null 表示跟随系统全局默认设置）",
+    )
+    store_page_size: int | None = Field(
+        default=None,
+        ge=0,
+        le=500,
+        description="舰船列表每页最大显示数量（0 表示显示全部，null 表示使用系统默认）",
+    )
+
+
+class UserPreferencesUpdateRequest(BaseModel):
+    """
+    更新当前登录用户个人偏好配置请求模型（支持按字段局部热更新）。
+    """
+
+    language_mode: Literal["bilingual", "zh", "en"] | None = Field(
+        default=None, description="船名及厂商显示语言偏好"
+    )
+    theme_mode: Literal["system", "light", "dark"] | None = Field(
+        default=None, description="界面外观主题偏好"
+    )
+    auec_rate: int | None = Field(
+        default=None, ge=1000, le=100000000, description="每小时预估游戏内收入（aUEC/h）"
+    )
+    details_card_order: list[str] | None = Field(
+        default=None, description="舰船详情弹窗信息卡片排序"
+    )
+    details_collapsed_cards: list[str] | None = Field(
+        default=None, description="舰船详情弹窗折叠卡片列表"
+    )
+    webhook_card_order: list[str] | None = Field(
+        default=None, description="推送渠道设置页卡片排序"
+    )
+    webhook_collapsed_ids: list[str] | None = Field(
+        default=None, description="推送渠道设置页折叠卡片 ID 列表"
+    )
+    owned_ccus: list[list[int]] | None = Field(
+        default=None, description="升级路线规划器中已囤好的 CCU 列表"
+    )
+    default_store_filters: list[str] | None = Field(
+        default=None,
+        description="个人首页默认筛选键列表；传入 null 表示恢复跟随系统默认",
+    )
+    default_store_sort: str | None = Field(
+        default=None,
+        description="个人首页默认排序键；传入 null 表示恢复跟随系统默认",
+    )
+    store_page_size: int | None = Field(
+        default=None,
+        ge=0,
+        le=500,
+        description="舰船列表每页最大显示数量（0 表示显示全部）",
+    )
+
+    @field_validator("default_store_filters")
+    @classmethod
+    def _validate_pref_filters(cls, value: list[str] | None) -> list[str] | None:
+        """
+        校验个人默认首页筛选键列表均属于系统合法筛选项。
+
+        @param value: 筛选键列表或 None
+        @return: 去重校验后的筛选键列表或 None
+        @raise ValueError: 包含未知筛选项时抛出
+        """
+        if value is None:
+            return None
+        valid = set(VALID_STORE_FILTER_KEYS)
+        cleaned: list[str] = []
+        for item in value:
+            key = str(item).strip()
+            if key not in valid:
+                raise ValueError(f"不支持的默认筛选条件：{key}")
+            if key not in cleaned:
+                cleaned.append(key)
+        return cleaned
+
+    @field_validator("default_store_sort")
+    @classmethod
+    def _validate_pref_sort(cls, value: str | None) -> str | None:
+        """
+        校验个人默认排序键是否合法。
+
+        @param value: 排序键或 None
+        @return: 合法排序键或 None
+        @raise ValueError: 排序键不被支持时抛出
+        """
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if cleaned not in VALID_STORE_SORT_KEYS:
+            raise ValueError(f"不支持的默认排序方式：{cleaned}")
+        return cleaned
+
+
+class PasskeyItemSchema(BaseModel):
+    """
+    用户已绑定的 Passkey 通行密钥摘要模型。
+    """
+
+    id: int = Field(description="Passkey 凭据内部唯一 ID")
+    name: str = Field(description="设备或密钥显示名称")
+    transports: list[str] = Field(default_factory=list, description="支持的传输方式列表")
+    backed_up: bool = Field(description="该通行密钥是否支持跨设备云端备份同步")
+    last_used_at: datetime | None = Field(default=None, description="最近一次用于登录的 UTC 时间")
+    created_at: datetime = Field(description="绑定创建 UTC 时间")
+
+
+class PasskeyListResponse(BaseModel):
+    """
+    当前用户已绑定 Passkey 列表响应模型。
+    """
+
+    items: list[PasskeyItemSchema] = Field(description="已绑定 Passkey 凭据列表")
+    total: int = Field(description="Passkey 总数")
+
+
+class PasskeyChallengeResponse(BaseModel):
+    """
+    发起 Passkey 注册或认证仪式返回的挑战参数响应模型。
+    """
+
+    challenge_id: str = Field(description="服务端单次挑战关联标识")
+    options: dict[str, Any] = Field(
+        description="标准 WebAuthn CreationOptions / RequestOptions JSON"
+    )
+
+
+class PasskeyRegisterVerifyRequest(BaseModel):
+    """
+    提交浏览器生成的 Passkey 注册凭据响应模型。
+    """
+
+    challenge_id: str = Field(min_length=8, description="注册挑战标识 ID")
+    name: str = Field(default="", max_length=120, description="用户为该通行密钥指定的名称")
+    credential: dict[str, Any] = Field(
+        description="navigator.credentials.create() 返回的 JSON 凭据"
+    )
+
+
+class PasskeyLoginOptionsRequest(BaseModel):
+    """
+    发起 Passkey 免密或指定账号登录请求模型。
+    """
+
+    username: str = Field(
+        default="",
+        max_length=64,
+        description="可选用户名提示（留空启用可发现凭据）",
+    )
+
+
+class PasskeyLoginVerifyRequest(BaseModel):
+    """
+    提交浏览器生成的 Passkey 登录签名响应模型。
+    """
+
+    challenge_id: str = Field(min_length=8, description="认证挑战标识 ID")
+    credential: dict[str, Any] = Field(
+        description="navigator.credentials.get() 返回的 JSON 断言凭据"
+    )
+
+
+class PasskeyRenameRequest(BaseModel):
+    """
+    重命名已绑定 Passkey 设备名称请求模型。
+    """
+
+    name: str = Field(min_length=1, max_length=120, description="新的 Passkey 设备显示名称")
 
 
 class HealthResponse(BaseModel):
@@ -32,8 +240,15 @@ class AuthUserSchema(BaseModel):
     role: Literal["admin", "user"] = Field(description="账号角色（admin 管理员 / user 普通用户）")
     is_active: bool = Field(description="账号是否处于启用状态")
     totp_enabled: bool = Field(description="是否已开启 TOTP 动态口令二步验证")
+    totp_backup_codes_remaining: int = Field(
+        default=0, description="当前剩余可用的 TOTP 一次性备用恢复码数量"
+    )
     has_password: bool = Field(description="是否已配置本地密码")
     oidc_bound: bool = Field(description="是否已绑定外部 OIDC SSO 身份")
+    passkey_count: int = Field(default=0, description="已绑定的 Passkey 通行密钥数量")
+    preferences: UserPreferencesSchema = Field(
+        default_factory=UserPreferencesSchema, description="跨设备同步的个人网站偏好"
+    )
     last_login_at: datetime | None = Field(default=None, description="最近一次成功登录 UTC 时间")
     created_at: datetime | None = Field(default=None, description="账号创建 UTC 时间")
     updated_at: datetime | None = Field(default=None, description="账号最后更新 UTC 时间")
@@ -52,6 +267,13 @@ class AuthStatusResponse(BaseModel):
     authenticated: bool = Field(description="当前请求是否已成功认证登录")
     sso_enabled: bool = Field(description="是否已启用并配置好 OIDC SSO 登录")
     sso_provider_name: str = Field(description="SSO 认证提供方名称（如 ZITADEL）")
+    passkey_enabled: bool = Field(default=True, description="是否已启用 Passkey 通行密钥登录")
+    default_store_filters: list[str] = Field(
+        default_factory=list, description="系统全局首页默认筛选键列表"
+    )
+    default_store_sort: str = Field(
+        default="price-desc", description="系统全局首页默认排序键"
+    )
     upgrade_planner_enabled: bool = Field(
         default=False, description="是否已启用升级路线规划（/plan）功能"
     )
@@ -83,11 +305,13 @@ class LoginRequest(BaseModel):
 
 class LoginOtpRequest(BaseModel):
     """
-    二步验证 TOTP 动态口令提交请求模型。
+    二步验证 TOTP 动态口令或一次性备用恢复码提交请求模型。
     """
 
     mfa_token: str = Field(min_length=10, description="密码登录返回的短期 MFA 挑战令牌")
-    otp_code: str = Field(min_length=6, max_length=12, description="6 位 TOTP 动态口令")
+    otp_code: str = Field(
+        min_length=6, max_length=20, description="6 位 TOTP 动态口令或一次性备用恢复码"
+    )
 
 
 class LoginResponse(BaseModel):
@@ -131,12 +355,41 @@ class TotpVerifyRequest(BaseModel):
     otp_code: str = Field(min_length=6, max_length=12, description="验证器 App 生成的 6 位动态口令")
 
 
+class TotpEnableResponse(BaseModel):
+    """
+    启用 TOTP 二步验证成功后返回的用户状态与仅展示一次的备用恢复码响应模型。
+    """
+
+    user: AuthUserSchema = Field(description="更新后的当前登录用户摘要")
+    backup_codes: list[str] = Field(
+        default_factory=list, description="仅在本次生成的 8 个一次性备用恢复码"
+    )
+
+
+class TotpBackupCodesRegenerateRequest(BaseModel):
+    """
+    重新生成 TOTP 一次性备用恢复码验证请求模型。
+    """
+
+    otp_code: str = Field(default="", max_length=20, description="当前 6 位 OTP 动态口令（优先）")
+    current_password: str = Field(default="", max_length=128, description="或当前登录密码")
+
+
+class TotpBackupCodesResponse(BaseModel):
+    """
+    重新生成备用恢复码响应模型。
+    """
+
+    backup_codes: list[str] = Field(description="新生成的 8 个一次性备用恢复码")
+    remaining: int = Field(description="当前有效备用恢复码总数量")
+
+
 class TotpDisableRequest(BaseModel):
     """
     停用自身 TOTP 二步验证请求模型。
     """
 
-    otp_code: str = Field(default="", max_length=12, description="当前 6 位 OTP 口令")
+    otp_code: str = Field(default="", max_length=20, description="当前 6 位 OTP 口令或备用恢复码")
     current_password: str = Field(default="", max_length=128, description="或输入当前账号密码核验")
 
 
@@ -816,6 +1069,12 @@ class DynamicSettingsResponse(BaseModel):
     default_language: Literal["bilingual", "zh", "en"] = Field(
         description="前端默认船名显示模式（bilingual/zh/en）"
     )
+    default_store_filters: list[str] = Field(
+        default_factory=list, description="系统全局首页默认筛选条件键列表"
+    )
+    default_store_sort: str = Field(
+        default="price-desc", description="系统全局首页默认排序方式键"
+    )
     log_retention_days: int = Field(description="推送日志与变动记录保留天数（0 表示永久保留）")
     translate_enabled: bool = Field(description="是否启用 OpenAI 兼容接口自动翻译兜底")
     translate_api_base: str = Field(description="OpenAI 兼容翻译接口 Base URL")
@@ -838,6 +1097,12 @@ class DynamicSettingsResponse(BaseModel):
     sso_scopes: str = Field(description="OIDC 请求 Scope 列表")
     sso_auto_register: bool = Field(description="SSO 首次登录时是否自动创建新账号")
     sso_default_role: Literal["admin", "user"] = Field(description="SSO 自动注册新账号的默认角色")
+    passkey_enabled: bool = Field(default=True, description="是否启用 Passkey 通行密钥登录")
+    passkey_rp_id: str = Field(default="", description="Passkey RP ID（留空时自动识别访问域名）")
+    passkey_rp_name: str = Field(default="CCUJailer", description="Passkey 站点展示名称")
+    passkey_origin: str = Field(
+        default="", description="Passkey 允许来源 Origin（逗号分隔，留空自动识别）"
+    )
     upgrade_planner_enabled: bool = Field(description="是否启用升级路线规划（/plan）功能")
 
 
@@ -857,6 +1122,12 @@ class DynamicSettingsUpdateRequest(BaseModel):
     )
     default_language: Literal["bilingual", "zh", "en"] | None = Field(
         default=None, description="前端默认显示语言模式"
+    )
+    default_store_filters: list[str] | None = Field(
+        default=None, description="系统全局首页默认筛选条件键列表"
+    )
+    default_store_sort: str | None = Field(
+        default=None, description="系统全局首页默认排序方式键"
     )
     log_retention_days: int | None = Field(
         default=None, ge=0, le=3650, description="历史日志保留天数（0-3650）"
@@ -886,9 +1157,43 @@ class DynamicSettingsUpdateRequest(BaseModel):
     sso_default_role: Literal["admin", "user"] | None = Field(
         default=None, description="SSO 自动注册默认角色"
     )
+    passkey_enabled: bool | None = Field(default=None, description="是否启用 Passkey 通行密钥登录")
+    passkey_rp_id: str | None = Field(
+        default=None, max_length=255, description="Passkey 依赖方域名 RP ID"
+    )
+    passkey_rp_name: str | None = Field(
+        default=None, max_length=120, description="Passkey 站点展示名称"
+    )
+    passkey_origin: str | None = Field(
+        default=None, max_length=512, description="Passkey 允许来源 Origin 列表"
+    )
     upgrade_planner_enabled: bool | None = Field(
         default=None, description="是否启用升级路线规划（/plan）功能"
     )
+
+    @field_validator("default_store_filters")
+    @classmethod
+    def _validate_default_filters(cls, value: list[str] | None) -> list[str] | None:
+        """
+        校验系统全局默认首页筛选键列表是否合法。
+
+        @param value: 筛选键列表或 None
+        @return: 去重后的合法筛选键列表或 None
+        @raise ValueError: 当包含不支持的筛选项时抛出
+        """
+        return UserPreferencesUpdateRequest._validate_pref_filters(value)
+
+    @field_validator("default_store_sort")
+    @classmethod
+    def _validate_default_sort(cls, value: str | None) -> str | None:
+        """
+        校验系统全局默认排序方式键是否合法。
+
+        @param value: 排序键或 None
+        @return: 合法排序键或 None
+        @raise ValueError: 当排序键不被支持时抛出
+        """
+        return UserPreferencesUpdateRequest._validate_pref_sort(value)
 
 
 FullStoreResponse.model_rebuild()

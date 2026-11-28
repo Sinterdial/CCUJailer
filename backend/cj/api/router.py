@@ -6,6 +6,7 @@ RESTful API v1 路由分发模块。
 用户管理、全量商店富化数据、升级路线规划以及可编程 Webhook 配置管理。
 """
 
+import json
 from dataclasses import asdict
 from typing import Annotated, NoReturn
 
@@ -46,6 +47,13 @@ from cj.api.schemas import (
     LoginOtpRequest,
     LoginRequest,
     LoginResponse,
+    PasskeyChallengeResponse,
+    PasskeyItemSchema,
+    PasskeyListResponse,
+    PasskeyLoginOptionsRequest,
+    PasskeyLoginVerifyRequest,
+    PasskeyRegisterVerifyRequest,
+    PasskeyRenameRequest,
     RegisterUserRequest,
     SetupAdminRequest,
     ShipI18nOverrideRequest,
@@ -55,13 +63,18 @@ from cj.api.schemas import (
     SsoAuthorizeResponse,
     SsoCallbackRequest,
     StatusSummaryResponse,
+    TotpBackupCodesRegenerateRequest,
+    TotpBackupCodesResponse,
     TotpDisableRequest,
+    TotpEnableResponse,
     TotpSetupResponse,
     TotpVerifyRequest,
     UpgradeCostsResponse,
     UpgradePlanResponse,
     UserCreateRequest,
     UserListResponse,
+    UserPreferencesSchema,
+    UserPreferencesUpdateRequest,
     UserUpdateRequest,
     WebhookLogItemResponse,
     WebhookLogListResponse,
@@ -162,8 +175,11 @@ def _to_login_response(
             role=outcome.user.role,
             is_active=outcome.user.is_active,
             totp_enabled=outcome.user.totp_enabled,
+            totp_backup_codes_remaining=outcome.user.totp_backup_codes_remaining,
             has_password=outcome.user.has_password,
             oidc_bound=outcome.user.oidc_bound,
+            passkey_count=outcome.user.passkey_count,
+            preferences=UserPreferencesSchema(**outcome.user.preferences),
         )
         if outcome.user is not None
         else None
@@ -193,6 +209,8 @@ def _to_settings_response(
         catalog_sync_interval_seconds=snapshot.catalog_sync_interval_seconds,
         i18n_source_url=snapshot.i18n_source_url,
         default_language=snapshot.default_language,
+        default_store_filters=list(snapshot.default_store_filters),
+        default_store_sort=snapshot.default_store_sort,
         log_retention_days=snapshot.log_retention_days,
         translate_enabled=snapshot.translate_enabled,
         translate_api_base=snapshot.translate_api_base,
@@ -207,8 +225,27 @@ def _to_settings_response(
         sso_scopes=snapshot.sso_scopes,
         sso_auto_register=snapshot.sso_auto_register,
         sso_default_role=snapshot.sso_default_role,
+        passkey_enabled=snapshot.passkey_enabled,
+        passkey_rp_id=snapshot.passkey_rp_id,
+        passkey_rp_name=snapshot.passkey_rp_name,
+        passkey_origin=snapshot.passkey_origin,
         upgrade_planner_enabled=snapshot.upgrade_planner_enabled,
     )
+
+
+def _extract_request_origin_context(request: Request) -> tuple[str, str, str]:
+    """
+    提取反向代理后的请求 Origin、Host 与协议方案，用于 WebAuthn RP 推导与来源校验。
+
+    @param request: FastAPI 请求对象
+    @return: (origin, host, scheme) 三元组
+    """
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    host = forwarded_host or (request.headers.get("host") or "").strip()
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    scheme = forwarded_proto or request.url.scheme or "https"
+    return origin, host, scheme
 
 
 @router.get("/auth/status", response_model=AuthStatusResponse, tags=["Auth"])
@@ -494,8 +531,11 @@ async def change_own_password(
             role=current_user.role,
             is_active=current_user.is_active,
             totp_enabled=current_user.totp_enabled,
+            totp_backup_codes_remaining=current_user.totp_backup_codes_remaining,
             has_password=True,
             oidc_bound=current_user.oidc_bound,
+            passkey_count=current_user.passkey_count,
+            preferences=UserPreferencesSchema(**current_user.preferences),
         ),
     )
 
@@ -524,19 +564,19 @@ async def setup_own_totp(
     return TotpSetupResponse(**res)
 
 
-@router.post("/auth/otp/enable", response_model=AuthUserSchema, tags=["Auth"])
+@router.post("/auth/otp/enable", response_model=TotpEnableResponse, tags=["Auth"])
 async def enable_own_totp(
     payload: TotpVerifyRequest,
     current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
-) -> AuthUserSchema:
+) -> TotpEnableResponse:
     """
-    核验 6 位动态口令并启用当前账号的 TOTP 二步验证。
+    核验 6 位动态口令并启用当前账号的 TOTP 二步验证，同时返回一次性备用恢复码列表。
 
     @param payload: 6 位验证码请求体
     @param current_user: 当前登录用户
     @param auth_service: 认证服务
-    @return: 更新后的 AuthUserSchema 模型
+    @return: TotpEnableResponse 模型（含用户信息及 8 个备用恢复码）
     """
     if current_user.id == 0:
         raise HTTPException(
@@ -544,10 +584,44 @@ async def enable_own_totp(
             detail="静态 ADMIN_TOKEN 会话不支持绑定 OTP",
         )
     try:
-        summary = await auth_service.enable_totp(current_user.id, payload.otp_code)
+        summary, backup_codes = await auth_service.enable_totp(current_user.id, payload.otp_code)
     except AuthError as exc:
         _raise_auth_http_error(exc)
-    return AuthUserSchema(**summary)
+    return TotpEnableResponse(user=AuthUserSchema(**summary), backup_codes=backup_codes)
+
+
+@router.post(
+    "/auth/otp/backup-codes/regenerate",
+    response_model=TotpBackupCodesResponse,
+    tags=["Auth"],
+)
+async def regenerate_own_totp_backup_codes(
+    payload: TotpBackupCodesRegenerateRequest,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> TotpBackupCodesResponse:
+    """
+    核验 OTP 动态口令或登录密码后重新生成一组 8 个 TOTP 一次性备用恢复码。
+
+    @param payload: 身份核验请求体
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: TotpBackupCodesResponse 新备用恢复码响应
+    """
+    if current_user.id == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="静态 ADMIN_TOKEN 会话不支持操作 OTP 备用恢复码",
+        )
+    try:
+        codes = await auth_service.regenerate_totp_backup_codes(
+            user_id=current_user.id,
+            otp_code=payload.otp_code,
+            current_password=payload.current_password,
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return TotpBackupCodesResponse(backup_codes=codes, remaining=len(codes))
 
 
 @router.post("/auth/otp/disable", response_model=AuthUserSchema, tags=["Auth"])
@@ -578,6 +652,231 @@ async def disable_own_totp(
     except AuthError as exc:
         _raise_auth_http_error(exc)
     return AuthUserSchema(**summary)
+
+
+@router.get("/auth/preferences", response_model=UserPreferencesSchema, tags=["Auth"])
+async def get_own_preferences(
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> UserPreferencesSchema:
+    """
+    读取当前已登录账号的跨设备个人网站偏好设置。
+
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: UserPreferencesSchema 模型
+    """
+    try:
+        prefs = await auth_service.get_user_preferences(current_user.id)
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return UserPreferencesSchema(**prefs)
+
+
+@router.put("/auth/preferences", response_model=UserPreferencesSchema, tags=["Auth"])
+async def update_own_preferences(
+    payload: UserPreferencesUpdateRequest,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> UserPreferencesSchema:
+    """
+    局部更新当前登录账号的跨设备偏好配置（卡片顺序、折叠状态、默认首页筛选与显示偏好等）。
+
+    @param payload: 个人偏好更新请求体
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: 更新后的 UserPreferencesSchema 模型
+    """
+    try:
+        prefs = await auth_service.update_user_preferences(
+            current_user.id,
+            payload.model_dump(exclude_unset=True),
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return UserPreferencesSchema(**prefs)
+
+
+@router.get("/auth/passkeys", response_model=PasskeyListResponse, tags=["Auth"])
+async def list_own_passkeys(
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> PasskeyListResponse:
+    """
+    列出当前已登录账号名下绑定的全部 Passkey 通行密钥。
+
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: PasskeyListResponse 模型
+    """
+    rows = await auth_service.list_user_passkeys(current_user.id)
+    items = [PasskeyItemSchema(**row) for row in rows]
+    return PasskeyListResponse(items=items, total=len(items))
+
+
+@router.post(
+    "/auth/passkeys/register/options",
+    response_model=PasskeyChallengeResponse,
+    tags=["Auth"],
+)
+async def begin_passkey_registration(
+    request: Request,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> PasskeyChallengeResponse:
+    """
+    为当前已登录账号生成 WebAuthn / Passkey 注册挑战参数。
+
+    @param request: HTTP 请求对象
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: PasskeyChallengeResponse 模型
+    """
+    origin, host, scheme = _extract_request_origin_context(request)
+    try:
+        res = await auth_service.begin_passkey_registration(
+            current_user.id,
+            request_origin=origin,
+            request_host=host,
+            request_scheme=scheme,
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return PasskeyChallengeResponse(**res)
+
+
+@router.post(
+    "/auth/passkeys/register/verify",
+    response_model=PasskeyItemSchema,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Auth"],
+)
+async def verify_passkey_registration(
+    payload: PasskeyRegisterVerifyRequest,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> PasskeyItemSchema:
+    """
+    核验浏览器提交的 Passkey 注册响应并写入凭据表。
+
+    @param payload: 注册验证请求体
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: PasskeyItemSchema 新绑定凭据摘要
+    """
+    try:
+        item = await auth_service.complete_passkey_registration(
+            current_user.id,
+            challenge_id=payload.challenge_id,
+            credential=payload.credential,
+            name=payload.name,
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return PasskeyItemSchema(**item)
+
+
+@router.put("/auth/passkeys/{passkey_id}", response_model=PasskeyItemSchema, tags=["Auth"])
+async def rename_own_passkey(
+    passkey_id: int,
+    payload: PasskeyRenameRequest,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> PasskeyItemSchema:
+    """
+    修改当前用户已绑定 Passkey 的设备显示名称。
+
+    @param passkey_id: Passkey 主键 ID
+    @param payload: 重命名请求体
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: 更新后的 PasskeyItemSchema 模型
+    """
+    try:
+        item = await auth_service.rename_user_passkey(current_user.id, passkey_id, payload.name)
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return PasskeyItemSchema(**item)
+
+
+@router.delete("/auth/passkeys/{passkey_id}", response_model=DeleteResponse, tags=["Auth"])
+async def delete_own_passkey(
+    passkey_id: int,
+    current_user: Annotated[AuthenticatedUser, Depends(require_authenticated_user)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> DeleteResponse:
+    """
+    解绑并删除当前用户指定的 Passkey 通行密钥。
+
+    @param passkey_id: Passkey 主键 ID
+    @param current_user: 当前登录用户
+    @param auth_service: 认证服务
+    @return: DeleteResponse 确认模型
+    """
+    try:
+        await auth_service.delete_user_passkey(current_user.id, passkey_id)
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return DeleteResponse(deleted=True, id=str(passkey_id))
+
+
+@router.post(
+    "/auth/passkeys/login/options",
+    response_model=PasskeyChallengeResponse,
+    tags=["Auth"],
+)
+async def begin_passkey_login(
+    payload: PasskeyLoginOptionsRequest,
+    request: Request,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> PasskeyChallengeResponse:
+    """
+    发起 Passkey 免密/指定用户名登录挑战，返回 WebAuthn RequestOptions。
+
+    @param payload: 可选用户名提示请求体
+    @param request: HTTP 请求对象
+    @param auth_service: 认证服务
+    @return: PasskeyChallengeResponse 模型
+    """
+    origin, host, scheme = _extract_request_origin_context(request)
+    try:
+        res = await auth_service.begin_passkey_login(
+            username=payload.username,
+            request_origin=origin,
+            request_host=host,
+            request_scheme=scheme,
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return PasskeyChallengeResponse(**res)
+
+
+@router.post("/auth/passkeys/login/verify", response_model=LoginResponse, tags=["Auth"])
+async def verify_passkey_login(
+    payload: PasskeyLoginVerifyRequest,
+    request: Request,
+    response: Response,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> LoginResponse:
+    """
+    校验 Passkey 签名断言并签发系统正式登录会话与 Cookie。
+
+    @param payload: Passkey 登录签名请求体
+    @param request: HTTP 请求对象
+    @param response: HTTP 响应对象
+    @param auth_service: 认证服务
+    @param settings: 应用静态配置
+    @return: LoginResponse 会话凭据模型
+    """
+    try:
+        outcome = await auth_service.complete_passkey_login(
+            challenge_id=payload.challenge_id,
+            credential=payload.credential,
+        )
+    except AuthError as exc:
+        _raise_auth_http_error(exc)
+    return _to_login_response(outcome, request, response, settings)
 
 
 @router.get(
@@ -1069,6 +1368,12 @@ async def update_dynamic_settings(
         updates[SystemConfigKey.I18N_SOURCE_URL] = payload.i18n_source_url.strip()
     if payload.default_language is not None:
         updates[SystemConfigKey.DEFAULT_LANGUAGE] = payload.default_language
+    if payload.default_store_filters is not None:
+        updates[SystemConfigKey.DEFAULT_STORE_FILTERS] = json.dumps(
+            payload.default_store_filters
+        )
+    if payload.default_store_sort is not None:
+        updates[SystemConfigKey.DEFAULT_STORE_SORT] = payload.default_store_sort
     if payload.log_retention_days is not None:
         updates[SystemConfigKey.LOG_RETENTION_DAYS] = str(payload.log_retention_days)
     if payload.translate_enabled is not None:
@@ -1097,6 +1402,21 @@ async def update_dynamic_settings(
         )
     if payload.sso_default_role is not None:
         updates[SystemConfigKey.SSO_DEFAULT_ROLE] = payload.sso_default_role
+    if payload.passkey_enabled is not None:
+        updates[SystemConfigKey.PASSKEY_ENABLED] = (
+            "true" if payload.passkey_enabled else "false"
+        )
+    if payload.passkey_rp_id is not None:
+        updates[SystemConfigKey.PASSKEY_RP_ID] = payload.passkey_rp_id.strip().lower()
+    if payload.passkey_rp_name is not None:
+        updates[SystemConfigKey.PASSKEY_RP_NAME] = payload.passkey_rp_name.strip() or "CCUJailer"
+    if payload.passkey_origin is not None:
+        cleaned_origins = [
+            item.strip().rstrip("/")
+            for item in payload.passkey_origin.split(",")
+            if item.strip()
+        ]
+        updates[SystemConfigKey.PASSKEY_ORIGIN] = ",".join(cleaned_origins)
     if payload.upgrade_planner_enabled is not None:
         updates[SystemConfigKey.UPGRADE_PLANNER_ENABLED] = (
             "true" if payload.upgrade_planner_enabled else "false"

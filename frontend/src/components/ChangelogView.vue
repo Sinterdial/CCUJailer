@@ -25,12 +25,12 @@ const EVENT_LABELS: Record<string, { label: string; tone: string }> = {
   "ccu.listed": { label: "CCU 上架", tone: "good" },
   "ccu.relisted": { label: "CCU 返场", tone: "info" },
   "ccu.price_changed": { label: "CCU 调价", tone: "warn" },
-  "ccu.delisted": { label: "CCU 下架", tone: "bad" },
+  "ccu.delisted": { label: "普通 CCU 下架", tone: "bad" },
   "store.new": { label: "单船上架", tone: "good" },
   "store.back": { label: "单船返场", tone: "good" },
   "store.restock": { label: "重新补货", tone: "good" },
   "store.sold_out": { label: "库存售罄", tone: "bad" },
-  "store.gone": { label: "离开商店", tone: "bad" },
+  "store.gone": { label: "整船下架", tone: "bad" },
   "store.price_changed": { label: "单船调价", tone: "info" },
 };
 
@@ -52,8 +52,13 @@ async function loadChangelog(): Promise<void> {
   }
 }
 
-function eventMeta(eventType: string) {
-  return EVENT_LABELS[eventType] || { label: eventType, tone: "info" };
+function eventMeta(row: ChangelogItem) {
+  if (row.event_type === "ccu.delisted") {
+    return row.is_warbond
+      ? { label: "WBCCU 下架", tone: "bad" }
+      : { label: "普通 CCU 下架", tone: "bad" };
+  }
+  return EVENT_LABELS[row.event_type] || { label: row.event_type, tone: "info" };
 }
 
 onMounted(() => {
@@ -85,11 +90,12 @@ onMounted(() => {
           <option value="ccu.listed">CCU 上架</option>
           <option value="ccu.relisted">CCU 返场</option>
           <option value="ccu.price_changed">CCU 调价</option>
-          <option value="ccu.delisted">CCU 下架</option>
+          <option value="ccu.wb_delisted">WBCCU 下架</option>
+          <option value="ccu.standard_delisted">普通 CCU 下架</option>
           <option value="store.new">单船上架</option>
           <option value="store.back">单船返场</option>
           <option value="store.sold_out">库存售罄</option>
-          <option value="store.gone">离开商店</option>
+          <option value="store.gone">整船下架</option>
           <option value="store.price_changed">单船调价</option>
         </select>
         <button type="submit" class="navbtn primary">查询</button>
@@ -114,12 +120,14 @@ onMounted(() => {
     <ul v-else class="changes">
       <li v-for="row in items" :key="row.id">
         <time :title="formatUtcTime(row.occurred_at)">{{ formatAgo(row.occurred_at) }}</time>
-        <span class="pill" :class="eventMeta(row.event_type).tone">
-          {{ eventMeta(row.event_type).label }}
+        <span class="pill" :class="eventMeta(row).tone">
+          {{ eventMeta(row).label }}
         </span>
         <span class="nm">
-          {{ formatShipDisplay(row.ship_name_en, row.ship_name_zh, appStore.languageMode) }}
-          <span class="muted cell-sub pill-inline" style="font-weight: 400">
+          <span class="nm-title">
+            {{ formatShipDisplay(row.ship_name_en, row.ship_name_zh, appStore.languageMode) }}
+          </span>
+          <span class="muted cell-sub pill-inline nm-edition">
             {{ row.is_warbond ? `Warbond · ${row.edition_label}` : row.edition_label }}
           </span>
         </span>

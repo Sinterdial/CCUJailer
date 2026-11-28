@@ -326,9 +326,11 @@ class User(Base):
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     totp_pending_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    totp_backup_codes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     oidc_issuer: Mapped[str | None] = mapped_column(String(512), nullable=True)
     oidc_sub: Mapped[str | None] = mapped_column(String(255), nullable=True)
     token_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -385,3 +387,54 @@ class InviteCode(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserPasskey(Base):
+    """
+    用户 WebAuthn / Passkey 通行密钥凭据表。
+
+    存储每个用户已绑定的平台/跨平台 FIDO2 公钥凭据、签名计数器、传输方式及最近使用时间。
+
+    @cvar __tablename__: 数据库表名 user_passkeys
+    """
+
+    __tablename__ = "user_passkeys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    credential_id: Mapped[str] = mapped_column(String(512), unique=True, index=True, nullable=False)
+    public_key: Mapped[str] = mapped_column(Text, nullable=False)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    name: Mapped[str] = mapped_column(String(120), default="Passkey", nullable=False)
+    transports: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    backed_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    aaguid: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class WebAuthnChallenge(Base):
+    """
+    WebAuthn 注册与认证短期防重放挑战记录表。
+
+    @cvar __tablename__: 数据库表名 webauthn_challenges
+    """
+
+    __tablename__ = "webauthn_challenges"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    challenge: Mapped[str] = mapped_column(String(256), nullable=False)
+    rp_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    origin: Mapped[str] = mapped_column(String(512), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )

@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { KeyRound, ShieldCheck, UserPlus } from "lucide-vue-next";
+import { Fingerprint, KeyRound, ShieldCheck, UserPlus } from "lucide-vue-next";
 import { apiClient } from "../api/client";
 import { applySessionLogin, appStore, notify } from "../composables/useAppStore";
+import { getPasskeyAssertion, isPasskeyOriginUsable } from "../utils/webauthn";
 
 const submitting = ref(false);
+const passkeyBusy = ref(false);
 const ssoRedirecting = ref(false);
 const mfaToken = ref("");
 const callbackProcessing = ref(false);
@@ -41,7 +43,11 @@ const canSelfRegister = computed(
   () => !needsSetup.value && registrationMode.value !== "closed"
 );
 const ssoButtonLabel = computed(
-  () => `使用 ${appStore.authStatus.sso_provider_name || "ZITADEL"} SSO 登录`
+  () => `使用 ${appStore.authStatus.sso_provider_name || "OIDC"} 登录`
+);
+const passkeyOriginStatus = computed(() => isPasskeyOriginUsable());
+const passkeyAvailable = computed(
+  () => Boolean(appStore.authStatus.passkey_enabled && passkeyOriginStatus.value.ok)
 );
 
 watch(canSelfRegister, (allowed) => {
@@ -172,8 +178,35 @@ async function startSsoLogin(): Promise<void> {
     const res = await apiClient.getSsoAuthorizeUrl(getCallbackUrl());
     window.location.assign(res.authorize_url);
   } catch (err) {
-    notify(err instanceof Error ? err.message : "无法发起 SSO 登录", "error");
+    notify(err instanceof Error ? err.message : "无法发起 OIDC 登录", "error");
     ssoRedirecting.value = false;
+  }
+}
+
+async function startPasskeyLogin(): Promise<void> {
+  formError.value = "";
+  const originCheck = isPasskeyOriginUsable();
+  if (!originCheck.ok) {
+    formError.value = originCheck.reason;
+    notify(originCheck.reason, "error");
+    return;
+  }
+  passkeyBusy.value = true;
+  try {
+    const challenge = await apiClient.beginPasskeyLogin(loginForm.username.trim());
+    const credential = await getPasskeyAssertion(challenge.options);
+    const res = await apiClient.verifyPasskeyLogin({
+      challenge_id: challenge.challenge_id,
+      credential,
+    });
+    await applySessionLogin(res.access_token);
+    notify("Passkey 登录成功", "success");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Passkey 登录失败";
+    formError.value = msg;
+    notify(msg, "error");
+  } finally {
+    passkeyBusy.value = false;
   }
 }
 
@@ -238,7 +271,7 @@ onMounted(async () => {
       <div>
         <h2 class="auth-title">创建首个管理员账号</h2>
         <p class="panel-sub">
-          检测到当前尚未配置任何用户，请先创建系统管理员以开启商店监控、Webhook 规则与 SSO 设置。
+          检测到当前尚未配置任何用户，请先创建系统管理员以开启商店监控、推送设置与 OIDC 设置。
         </p>
       </div>
 
@@ -322,7 +355,7 @@ onMounted(async () => {
         <p class="panel-sub">
           {{
             isMfaStep
-              ? "请输入身份验证器 App 中显示的 6 位动态口令"
+              ? "请输入身份验证器 App 中显示的 6 位动态口令，或使用绑定时保存的一次性备用恢复码"
               : authMode === "register"
                 ? registrationMode === "invite_only"
                   ? "当前为邀请制注册，请填写有效邀请码完成账号创建"
@@ -357,17 +390,16 @@ onMounted(async () => {
 
       <form v-if="isMfaStep" class="form-stack" @submit.prevent="submitOtp">
         <label class="field-label">
-          6 位 OTP 动态口令
+          6 位 OTP 动态口令 / 备用恢复码
           <input
             v-model="loginForm.otpCode"
             name="otp_code"
             type="text"
-            inputmode="numeric"
             autocomplete="one-time-code"
             spellcheck="false"
             required
-            maxlength="8"
-            placeholder="000000"
+            maxlength="20"
+            placeholder="000000 或 XXXX-XXXX"
             class="input mono otp-input"
           />
         </label>
@@ -494,23 +526,36 @@ onMounted(async () => {
               class="input"
             />
           </label>
-          <button type="submit" class="navbtn primary btn-lg" :disabled="submitting">
+          <button type="submit" class="navbtn primary btn-lg" :disabled="submitting || passkeyBusy">
             <KeyRound :size="15" aria-hidden="true" />
             {{ submitting ? "登录中…" : "账号密码登录" }}
           </button>
         </form>
 
-        <template v-if="appStore.authStatus.sso_enabled">
+        <template v-if="passkeyAvailable || appStore.authStatus.sso_enabled">
           <div class="divider">或</div>
-          <button
-            type="button"
-            class="navbtn btn-full"
-            :disabled="ssoRedirecting"
-            @click="startSsoLogin"
-          >
-            <ShieldCheck :size="15" aria-hidden="true" />
-            {{ ssoRedirecting ? "正在跳转认证中心…" : ssoButtonLabel }}
-          </button>
+          <div class="form-stack">
+            <button
+              v-if="passkeyAvailable"
+              type="button"
+              class="navbtn btn-full"
+              :disabled="passkeyBusy || submitting"
+              @click="startPasskeyLogin"
+            >
+              <Fingerprint :size="15" aria-hidden="true" />
+              {{ passkeyBusy ? "正在验证 Passkey…" : "使用 Passkey 通行密钥登录" }}
+            </button>
+            <button
+              v-if="appStore.authStatus.sso_enabled"
+              type="button"
+              class="navbtn btn-full"
+              :disabled="ssoRedirecting || submitting || passkeyBusy"
+              @click="startSsoLogin"
+            >
+              <ShieldCheck :size="15" aria-hidden="true" />
+              {{ ssoRedirecting ? "正在跳转认证中心…" : ssoButtonLabel }}
+            </button>
+          </div>
         </template>
       </template>
     </div>

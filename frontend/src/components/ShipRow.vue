@@ -9,6 +9,11 @@ import {
   moneyFromCents,
 } from "../composables/useAppStore";
 import type { StoreEdition, StoreShip } from "../types/api";
+import {
+  formatManufacturer,
+  formatShipRoleZh,
+  formatShipSizeZh,
+} from "../utils/localization";
 
 const props = defineProps<{
   ship: StoreShip;
@@ -21,10 +26,11 @@ const props = defineProps<{
   gameVersion: string;
   byValueSort: boolean;
   plannerEnabled: boolean;
+  staggerIndex?: number;
 }>();
 
 const emit = defineEmits<{
-  (e: "pickFromShip"): void;
+  (e: "pickFromShip", ship: StoreShip): void;
   (e: "planRoute", payload: { fromKey: string; toRef: number }): void;
   (e: "openDetails", ship: StoreShip): void;
 }>();
@@ -34,7 +40,7 @@ const explainWhy = ref(false);
 const CCU_TOOL_URL = "https://robertsspaceindustries.com/en/account/pledges";
 
 const SOLD_TAGS: Record<string, [string, string]> = {
-  time: ["仅限大促", "仅在周年或厂商活动等限时促销期间开放购买"],
+  time: ["限时开售", "仅在周年或厂商活动等限时促销期间开放购买"],
   quantity: ["限量发售", "仅在特定时间限量分批抢购"],
   retiring: ["即将退市", "官方即将从公开商店下架该条目"],
 };
@@ -48,12 +54,12 @@ const anchorId = computed(() => `ship-${props.ship.key.replace(/\s+/g, "-")}`);
 const specsLine = computed(() => {
   const s = props.ship;
   const parts = [
-    s.maker,
-    s.role,
-    s.size,
+    formatManufacturer(s.maker, s.maker_code, appStore.languageMode),
+    formatShipRoleZh(s.role),
+    formatShipSizeZh(s.size),
     s.crew ? `乘员 ${s.crew}` : "",
     s.cargo ? `${s.cargo.toLocaleString("en-US")} SCU` : "",
-    s.released ? (s.released === "0" ? "机库时期实装" : `${s.released} 已实装`) : "",
+    s.released ? (s.released === "0" ? "早期机库已可飞" : `${s.released} 已可飞`) : "",
   ];
   return parts.filter(Boolean).join(" · ");
 });
@@ -65,7 +71,7 @@ const notFlyable = computed(
 
 const statusChinese = computed(() => {
   if (props.ship.status === "In concept") {
-    return "概念设计中";
+    return "画饼中";
   }
   if (props.ship.status === "In production") {
     return "正在开发中";
@@ -218,27 +224,74 @@ const lowExampleUpgrade = computed(
   () => props.ship.upgrades.find((u) => !/upgrade$/i.test(u.label)) || props.ship.upgrades[0]
 );
 
-const primaryUpgradeWithNearest = computed(() => {
-  const pool = props.ship.upgrades.filter((u) => (u.nearest_from_ships?.length || 0) > 0);
-  return pool.find((u) => u.is_warbond) || pool[0] || null;
-});
-
 const warbondUpgradeCards = computed(() =>
   (props.ship.upgrades || []).filter((u) => Boolean(u.is_warbond))
 );
 
-const closestTierNearestShips = computed(() => {
-  const list = primaryUpgradeWithNearest.value?.nearest_from_ships || [];
-  if (!list.length) {
+interface NearestUpgradeRow {
+  key: string;
+  tagLabel: string;
+  isWarbond: boolean;
+  candidates: NonNullable<(typeof props.ship.upgrades)[number]["nearest_from_ships"]>;
+}
+
+const nearestUpgradeRows = computed<NearestUpgradeRow[]>(() => {
+  const pool = (props.ship.upgrades || []).filter(
+    (u) => (u.nearest_from_ships?.length || 0) > 0
+  );
+  if (!pool.length) {
     return [];
   }
-  const minCost = Math.min(...list.map((cand) => cand.upgrade_cost));
-  return list.filter((cand) => Math.abs(cand.upgrade_cost - minCost) < 0.005);
+  const picked: { key: string; tagLabel: string; isWarbond: boolean; list: NearestUpgradeRow["candidates"] }[] = [];
+
+  const wbUpgrade = pool.find((u) => Boolean(u.is_warbond));
+  if (wbUpgrade?.nearest_from_ships?.length) {
+    picked.push({
+      key: `wb-${wbUpgrade.sku}`,
+      tagLabel: /bis/i.test(wbUpgrade.label) ? "BIS WBCCU" : "WBCCU",
+      isWarbond: true,
+      list: wbUpgrade.nearest_from_ships,
+    });
+  }
+
+  const stdCandidates = pool
+    .filter((u) => !u.is_warbond)
+    .slice()
+    .sort((a, b) => a.price - b.price);
+  const stdUpgrade = stdCandidates[0];
+  if (stdUpgrade?.nearest_from_ships?.length) {
+    picked.push({
+      key: `std-${stdUpgrade.sku}`,
+      tagLabel: "普通 CCU",
+      isWarbond: false,
+      list: stdUpgrade.nearest_from_ships,
+    });
+  }
+
+  return picked
+    .map((entry) => {
+      const minCost = Math.min(...entry.list.map((cand) => cand.upgrade_cost));
+      const candidates = entry.list.filter(
+        (cand) => Math.abs(cand.upgrade_cost - minCost) < 0.005
+      );
+      return {
+        key: entry.key,
+        tagLabel: entry.tagLabel,
+        isWarbond: entry.isWarbond,
+        candidates,
+      };
+    })
+    .filter((entry) => entry.candidates.length > 0);
 });
 </script>
 
 <template>
-  <li :id="anchorId" class="ship" :class="{ off: !ship.in_store }">
+  <li
+    :id="anchorId"
+    class="ship ship-reveal"
+    :class="{ off: !ship.in_store }"
+    :style="{ '--stagger-idx': staggerIndex ?? 0 }"
+  >
     <img
       v-if="ship.img"
       :src="ship.img"
@@ -275,7 +328,7 @@ const closestTierNearestShips = computed(() => {
 
       <p v-if="notFlyable" class="status">
         <span class="tag concept">{{ statusChinese }}</span>
-        <template v-if="ship.loaners"> · 借用替代船：{{ ship.loaners }}</template>
+        <template v-if="ship.loaners"> · 当前借船：{{ ship.loaners }}</template>
       </p>
 
       <button
@@ -287,9 +340,9 @@ const closestTierNearestShips = computed(() => {
       </button>
     </div>
 
-    <!-- 右侧采购区：Warbond 升级卡片（置最左）+ 整船版本卡片（Warbond 整船 / BIS / 低强调 10 Year）+ 绿色游戏内卡片 -->
+    <!-- 右侧采购区：WBCCU 卡片（置最左）+ 整船版本卡片（Warbond 整船 / BIS / 低强调 10 Year）+ 绿色游戏内卡片 -->
     <div class="buy">
-      <!-- 独立分列的 Warbond 升级 (WBCCU) 卡片：置最左展示，即使无单船 Warbond 也独立呈现 -->
+      <!-- 独立分列的 WBCCU 卡片：置最左展示，即使无单船 Warbond 也独立呈现 -->
       <a
         v-for="up in warbondUpgradeCards"
         :key="`wb-up-${up.sku}`"
@@ -299,7 +352,7 @@ const closestTierNearestShips = computed(() => {
         rel="noopener"
       >
         <span class="label" translate="no">
-          {{ /bis/i.test(up.label) ? "BIS WARBOND 升级" : "WARBOND 升级" }}
+          {{ /bis/i.test(up.label) ? "BIS WBCCU" : "WBCCU" }}
         </span>
         <span class="price" translate="no">
           <s v-if="ship.ccu && up.price < ship.ccu.value">
@@ -373,10 +426,6 @@ const closestTierNearestShips = computed(() => {
         <span class="price" translate="no">{{ formatAuec(rentMin) }}</span>
         <span class="ins">每日</span>
       </div>
-
-      <p v-if="!ship.in_store && !ship.upgrades.length" class="notin">
-        暂未在商店上架<template v-if="lastSeenIso">，上次在售 {{ formatAgo(lastSeenIso) }}</template>
-      </p>
     </div>
 
     <!-- 模块行 -->
@@ -452,6 +501,7 @@ const closestTierNearestShips = computed(() => {
       <template v-else>
         <span class="k">
           升级价值
+          <b v-if="ship.ccu" class="ccu-val">{{ moneyFromCents(ship.ccu.value) }}</b>
           <button
             type="button"
             class="why"
@@ -462,21 +512,9 @@ const closestTierNearestShips = computed(() => {
             ?
           </button>
         </span>
-        <span
-          v-for="u in ship.upgrades"
-          :key="u.sku"
-          class="u"
-          :class="{ deal: Boolean(u.is_warbond) }"
-        >
-          {{ u.label }} <b>{{ moneyFromCents(u.price) }}</b>
-          <template v-if="u.is_warbond && ship.ccu && u.price < ship.ccu.value">
-            (WBCCU · 立省 {{ moneyFromCents(ship.ccu.value - u.price) }})
-          </template>
-          <template v-else-if="u.is_warbond">
-            (WBCCU)
-          </template>
-        </span>
-        <button type="button" class="link mine" @click="emit('pickFromShip')">我需要补多少？</button>
+        <button type="button" class="link mine" @click="emit('pickFromShip', ship)">
+          我需要补多少？
+        </button>
         <button
           v-if="plannerEnabled && ship.ccu"
           type="button"
@@ -486,36 +524,47 @@ const closestTierNearestShips = computed(() => {
           规划升级路线
         </button>
 
-        <p v-if="explainWhy && lowExampleUpgrade" class="explain">
-          升级 (CCU) 用于将你机库中已有的船升级至目标舰船，实付金额约为「目标升级价值 - 原船价值」：
-          <template v-if="lowExampleUpgrade.price > 10000">
-            以一艘 $100 的船为例，购买 {{ lowExampleUpgrade.label }} 升级包需补
-            {{ moneyFromCents(lowExampleUpgrade.price - 10000) }}。
-          </template>
-          升级包需在 RSI 官网「My Hangar → Ship Upgrades」中选购；部分 Warbond 优惠限定特定起跳船，
-          点击「我需要补多少？」选择你的底船即可向 RSI 核实准确差价。
-          注：RSI 升级商店（Ship Upgrades）与单船商店（Standalone Ships）相互独立，官方常在日常或活动期间单独放出 Warbond 升级包（WBCCU）而不上架对应单船 Warbond 礼盒，因此可能出现下方升级行有 WBCCU 而右侧单船卡片无 Warbond 的情况。
-          <a class="tool" :href="CCU_TOOL_URL" target="_blank" rel="noopener">前往 RSI 机库 ↗</a>
-        </p>
+        <Transition name="holo-expand">
+          <p v-if="explainWhy && lowExampleUpgrade" class="explain">
+            升级 (CCU) 用于将你机库中已有的船升级至目标舰船，实付金额约为「目标升级价值 - 原船价值」：
+            <template v-if="lowExampleUpgrade.price > 10000">
+              以一艘 $100 的船为例，购买 {{ lowExampleUpgrade.label }} 升级包需补
+              {{ moneyFromCents(lowExampleUpgrade.price - 10000) }}。
+            </template>
+            升级包需在 RSI 官网「My Hangar → Ship Upgrades」中选购；部分 Warbond 优惠限定特定起跳船，
+            点击「我需要补多少？」选择你的可升级船即可向 RSI 核实准确差价。
+            注：RSI 升级商店（Ship Upgrades）与单船商店（Standalone Ships）相互独立，官方常在日常或活动期间单独放出 WBCCU 而不上架对应单船 Warbond 礼盒，因此可能出现下方有 WBCCU 卡片但无整船 Warbond 的情况。
+            <a class="tool" :href="CCU_TOOL_URL" target="_blank" rel="noopener">前往 RSI 机库 ↗</a>
+          </p>
+        </Transition>
       </template>
     </div>
 
-    <!-- 最近可升级自底船条（仅展示最接近的最低差价那一档） -->
-    <div v-if="closestTierNearestShips.length && !fromKey" class="nearest-row">
-      <span class="nearest-title">
-        最近可升级自 ({{ primaryUpgradeWithNearest?.label }})：
-      </span>
-      <span
-        v-for="cand in closestTierNearestShips"
-        :key="cand.name_en"
-        class="nearest-pill"
-        :class="{ always: cand.always_available }"
-        :title="`${cand.name_en} · 估值 $${cand.value}${cand.always_available ? ' · 常驻无限制底船' : ''}`"
+    <!-- 最近可升级船条（WBCCU 使用绿底色，普通 CCU 使用中性灰底色） -->
+    <div v-if="nearestUpgradeRows.length && !fromKey" class="nearest-rows">
+      <div
+        v-for="row in nearestUpgradeRows"
+        :key="row.key"
+        class="nearest-row"
+        :class="row.isWarbond ? 'is-wb' : 'is-std'"
       >
-        <span>{{ formatShipDisplay(cand.name_en, cand.name_zh, appStore.languageMode) }}</span>
-        <b>+${{ cand.upgrade_cost }}</b>
-        <span v-if="cand.always_available" class="nearest-tag">常驻</span>
-      </span>
+        <span class="nearest-title">最近可升级自 ({{ row.tagLabel }})：</span>
+        <span
+          v-for="cand in row.candidates"
+          :key="`${row.key}-${cand.name_en}`"
+          class="nearest-pill"
+          :class="{ wb: row.isWarbond, always: cand.always_available }"
+          :title="`${cand.name_en} · 估值 $${cand.value}${cand.always_available ? ' · 常驻无限制可升级船' : ''}`"
+        >
+          <span>{{ formatShipDisplay(cand.name_en, cand.name_zh, appStore.languageMode) }}</span>
+          <b>+${{ cand.upgrade_cost }}</b>
+          <span v-if="cand.always_available" class="nearest-tag">常驻</span>
+        </span>
+      </div>
     </div>
+
+    <p v-if="!ship.in_store && !ship.upgrades.length" class="notin">
+      暂未在商店上架<template v-if="lastSeenIso">，上次在售 {{ formatAgo(lastSeenIso) }}</template>
+    </p>
   </li>
 </template>

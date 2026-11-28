@@ -8,7 +8,12 @@ import httpx
 
 from cj.core.config import SystemConfigKey
 from cj.db.models import Ship
-from cj.services.i18n_service import I18nService, build_search_index, parse_remote_dictionary
+from cj.services.i18n_service import (
+    I18nService,
+    build_search_index,
+    parse_remote_dictionary,
+    parse_remote_dictionary_bundle,
+)
 from tests.conftest import install_mock_transport
 
 
@@ -135,3 +140,85 @@ async def test_sync_remote_dictionary_updates_db_search_index(
         assert ship is not None
         assert ship.name_zh == "银河号旗舰"
         assert "银河号旗舰" in ship.search_index
+
+
+async def test_sctoolbox_global_ini_bundle_and_class_name_matching(
+    isolated_settings,
+    migrated_session_factory,
+    ship_repo,
+    mock_net,
+    event_bus,
+    setting_service,
+) -> None:
+    """
+    验证 StarCitizenToolBox global.ini 解析（_short 优先、,P 标记剥离、厂商提取、前缀剥离）
+    以及数据库 Sync 时通过 class_name 进行高精度匹配。
+    """
+    sample_ini = "\n".join(
+        [
+            "manufacturer_NameAEGS=圣盾动力",
+            "manufacturer_NameASAD,P=灰石工业",
+            "vehicle_NameAEGS_Avenger_Titan=圣盾 复仇者 泰坦",
+            "vehicle_NameAEGS_Avenger_Titan_short=复仇者 泰坦",
+            "vehicle_NameCRUS_A1_Spirit=十字军 星灵 A1",
+            "vehicle_NameRSI_Zeus_Mk1_ES,P=罗伯茨太空工业 宙斯 Mk II ES",
+        ]
+    )
+    bundle = parse_remote_dictionary_bundle(sample_ini)
+    assert bundle["manufacturers"]["AEGS"] == "圣盾动力"
+    assert bundle["manufacturers"]["ASAD"] == "灰石工业"
+    assert bundle["by_class"]["aegs_avenger_titan"] == "复仇者 泰坦"
+    assert bundle["by_class"]["crus_a1_spirit"] == "星灵 A1"
+    assert bundle["by_class"]["rsi_zeus_mk1_es"] == "宙斯 Mk II ES"
+
+    async with migrated_session_factory() as session:
+        async with session.begin():
+            await ship_repo.add(
+                session,
+                Ship(
+                    key="a1 spirit",
+                    class_name="CRUS_A1_Spirit",
+                    name_en="A1 Spirit",
+                    name_zh="",
+                    search_index="a1 spirit",
+                    value_cents=20000,
+                ),
+            )
+            await ship_repo.add(
+                session,
+                Ship(
+                    key="zeus mk ii es",
+                    class_name="RSI_Zeus_Mk1_ES",
+                    name_en="Zeus Mk II ES",
+                    name_zh="",
+                    search_index="zeus mk ii es",
+                    value_cents=17500,
+                ),
+            )
+
+    await setting_service.update_settings(
+        {SystemConfigKey.I18N_SOURCE_URL: "https://i18n.test/global.ini"}
+    )
+    install_mock_transport(mock_net, lambda _req: httpx.Response(200, text=sample_ini))
+
+    service = I18nService(
+        settings=isolated_settings,
+        net=mock_net,
+        event_bus=event_bus,
+        session_factory=migrated_session_factory,
+        ship_repo=ship_repo,
+        setting_service=setting_service,
+    )
+    summary = await service.sync_remote_dictionary()
+    assert summary["remote_entries"] >= 3
+    assert summary["updated_ships"] == 2
+
+    async with migrated_session_factory() as session:
+        a1 = await ship_repo.get_by_key(session, "a1 spirit")
+        zeus = await ship_repo.get_by_key(session, "zeus mk ii es")
+        assert a1 is not None and a1.name_zh == "星灵 A1"
+        assert zeus is not None and zeus.name_zh == "宙斯 Mk II ES"
+
+    # 同时验证内置修正词典命中
+    assert service.resolve_local("Avenger Titan").name_zh == "复仇者 泰坦"
+    assert service.resolve_local("Nova").name_zh == "新星坦克"

@@ -17,6 +17,7 @@ import { apiClient } from "../api/client";
 import {
   appStore,
   formatUtcTime,
+  isAdminUser,
   notify,
   refreshBootstrapState,
 } from "../composables/useAppStore";
@@ -80,6 +81,9 @@ const inviteForm = reactive({
 });
 
 async function loadUsers(): Promise<void> {
+  if (!isAdminUser()) {
+    return;
+  }
   loading.value = true;
   try {
     const resp = await apiClient.listUsers();
@@ -92,6 +96,9 @@ async function loadUsers(): Promise<void> {
 }
 
 async function loadInvites(): Promise<void> {
+  if (!isAdminUser()) {
+    return;
+  }
   invitesLoading.value = true;
   try {
     const resp = await apiClient.listInvites();
@@ -302,7 +309,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="settings-section">
+  <section v-if="isAdminUser()" class="settings-section">
     <div class="panel">
       <div class="panel-header">
         <div>
@@ -324,7 +331,7 @@ onUnmounted(() => {
         <div>
           <h3 class="section-subhead">本地账号注册模式</h3>
           <p class="panel-sub">
-            控制登录页是否允许新用户自行创建本地账号；ZITADEL OIDC SSO 自动建号由「认证与 SSO」独立管理。
+            控制登录页是否允许新用户自行创建本地账号；OIDC 自动建号由「OIDC」独立管理。
           </p>
         </div>
         <span class="pill info">
@@ -544,7 +551,8 @@ onUnmounted(() => {
               <div class="badge-group">
                 <span v-if="user.has_password" class="pill neutral">密码</span>
                 <span v-if="user.totp_enabled" class="pill good">OTP</span>
-                <span v-if="user.oidc_bound" class="pill info">OIDC SSO</span>
+                <span v-if="user.passkey_count > 0" class="pill good">Passkey ×{{ user.passkey_count }}</span>
+                <span v-if="user.oidc_bound" class="pill info">OIDC</span>
               </div>
             </td>
             <td class="muted cell-nowrap">
@@ -586,7 +594,8 @@ onUnmounted(() => {
     </div>
 
     <!-- 新建/编辑用户弹窗 -->
-    <div v-if="modalOpen" class="modal-backdrop" @click.self="modalOpen = false">
+    <Transition name="holo-modal">
+      <div v-if="modalOpen" class="modal-backdrop" @click.self="modalOpen = false">
       <div
         class="modal-card compact"
         role="dialog"
@@ -680,5 +689,6 @@ onUnmounted(() => {
         </form>
       </div>
     </div>
+    </Transition>
   </section>
 </template>

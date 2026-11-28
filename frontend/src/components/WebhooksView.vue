@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   ArrowDown,
   ArrowUp,
@@ -13,7 +13,14 @@ import {
   X,
 } from "lucide-vue-next";
 import { apiClient } from "../api/client";
-import { ensureWriteAuthorized, formatUtcTime, notify } from "../composables/useAppStore";
+import {
+  appStore,
+  ensureWriteAuthorized,
+  formatUtcTime,
+  notify,
+  updateUserPreferences,
+} from "../composables/useAppStore";
+import { usePointerCardDrag } from "../composables/usePointerCardDrag";
 import type {
   WebhookLogItem,
   WebhookMethod,
@@ -38,7 +45,7 @@ const PROVIDER_LABELS: Record<WebhookProviderType, string> = {
 const WEBHOOK_EVENT_OPTIONS: { value: string; label: string; desc: string }[] = [
   {
     value: "ccu.warbond_upgrade",
-    label: "Warbond 升级",
+    label: "WBCCU",
     desc: "仅推送 WBCCU 上架、返场或降价通知",
   },
   {
@@ -235,10 +242,10 @@ async function saveRule(): Promise<void> {
 
     if (editingId.value) {
       await apiClient.updateWebhook(editingId.value, payload);
-      notify("Webhook 规则已更新", "success");
+      notify("推送规则已更新", "success");
     } else {
       await apiClient.createWebhook(payload);
-      notify("Webhook 规则创建成功", "success");
+      notify("推送规则创建成功", "success");
     }
     modalOpen.value = false;
     await loadAll();
@@ -265,12 +272,12 @@ async function removeRule(rule: WebhookRule): Promise<void> {
   if (!ensureWriteAuthorized()) {
     return;
   }
-  if (!window.confirm(`确定删除 Webhook 规则「${rule.name}」吗？其历史日志也会一并清除。`)) {
+  if (!window.confirm(`确定删除推送规则「${rule.name}」吗？其历史日志也会一并清除。`)) {
     return;
   }
   try {
     await apiClient.deleteWebhook(rule.id);
-    notify("已删除 Webhook 规则", "success");
+    notify("已删除推送规则", "success");
     await loadAll();
   } catch (err) {
     notify(err instanceof Error ? err.message : "删除规则失败", "error");
@@ -324,10 +331,35 @@ function saveIdArray(storageKey: string, items: string[]): void {
   }
 }
 
-const collapsedRuleIds = ref<Set<string>>(new Set(loadIdArray(WEBHOOK_COLLAPSED_KEY)));
-const customRuleOrder = ref<string[]>(loadIdArray(WEBHOOK_ORDER_KEY));
-const draggingRuleId = ref<string | null>(null);
-const dragOverRuleId = ref<string | null>(null);
+function loadInitialCollapsedRuleIds(): string[] {
+  if (appStore.authStatus.authenticated && Array.isArray(appStore.userPreferences.webhook_collapsed_ids)) {
+    return appStore.userPreferences.webhook_collapsed_ids.filter(
+      (v): v is string => typeof v === "string"
+    );
+  }
+  return loadIdArray(WEBHOOK_COLLAPSED_KEY);
+}
+
+function loadInitialRuleOrder(): string[] {
+  if (appStore.authStatus.authenticated && Array.isArray(appStore.userPreferences.webhook_card_order)) {
+    return appStore.userPreferences.webhook_card_order.filter(
+      (v): v is string => typeof v === "string"
+    );
+  }
+  return loadIdArray(WEBHOOK_ORDER_KEY);
+}
+
+const collapsedRuleIds = ref<Set<string>>(new Set(loadInitialCollapsedRuleIds()));
+const customRuleOrder = ref<string[]>(loadInitialRuleOrder());
+const rulesGridRef = ref<HTMLElement | null>(null);
+
+watch(
+  () => appStore.preferencesSyncVersion,
+  () => {
+    collapsedRuleIds.value = new Set(loadInitialCollapsedRuleIds());
+    customRuleOrder.value = loadInitialRuleOrder();
+  }
+);
 
 const orderedRules = computed(() => {
   if (customRuleOrder.value.length === 0) {
@@ -362,7 +394,9 @@ function toggleRuleCollapse(ruleId: string): void {
     next.add(ruleId);
   }
   collapsedRuleIds.value = next;
-  saveIdArray(WEBHOOK_COLLAPSED_KEY, [...next]);
+  const list = [...next];
+  saveIdArray(WEBHOOK_COLLAPSED_KEY, list);
+  void updateUserPreferences({ webhook_collapsed_ids: list });
 }
 
 function toggleAllRulesCollapse(): void {
@@ -377,7 +411,9 @@ function toggleAllRulesCollapse(): void {
     }
   }
   collapsedRuleIds.value = next;
-  saveIdArray(WEBHOOK_COLLAPSED_KEY, [...next]);
+  const list = [...next];
+  saveIdArray(WEBHOOK_COLLAPSED_KEY, list);
+  void updateUserPreferences({ webhook_collapsed_ids: list });
 }
 
 function applyRuleReorder(sourceId: string, targetIndex: number): void {
@@ -391,6 +427,7 @@ function applyRuleReorder(sourceId: string, targetIndex: number): void {
   reordered.splice(targetIndex, 0, moved);
   customRuleOrder.value = reordered;
   saveIdArray(WEBHOOK_ORDER_KEY, reordered);
+  void updateUserPreferences({ webhook_card_order: reordered });
 }
 
 function moveRuleByDirection(ruleId: string, direction: -1 | 1): void {
@@ -400,34 +437,38 @@ function moveRuleByDirection(ruleId: string, direction: -1 | 1): void {
   }
 }
 
-function handleRuleDragStart(ruleId: string, event: DragEvent): void {
-  draggingRuleId.value = ruleId;
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", ruleId);
+function reorderRulesByPosition(
+  sourceId: string,
+  targetId: string,
+  position: "before" | "after"
+): void {
+  const currentIds = orderedRules.value.map((r) => r.id);
+  const fromIdx = currentIds.indexOf(sourceId);
+  if (fromIdx === -1) {
+    return;
   }
+  const [moved] = currentIds.splice(fromIdx, 1);
+  const targetIdx = currentIds.indexOf(targetId);
+  if (targetIdx === -1) {
+    return;
+  }
+  const insertIdx = position === "before" ? targetIdx : targetIdx + 1;
+  currentIds.splice(insertIdx, 0, moved);
+  customRuleOrder.value = currentIds;
+  saveIdArray(WEBHOOK_ORDER_KEY, currentIds);
+  void updateUserPreferences({ webhook_card_order: currentIds });
 }
 
-function handleRuleDragOver(ruleId: string): void {
-  if (draggingRuleId.value && draggingRuleId.value !== ruleId) {
-    dragOverRuleId.value = ruleId;
-  }
-}
-
-function handleRuleDrop(targetId: string, event: DragEvent): void {
-  const src = draggingRuleId.value || event.dataTransfer?.getData("text/plain") || "";
-  const targetIdx = orderedRules.value.findIndex((r) => r.id === targetId);
-  if (src && targetIdx !== -1) {
-    applyRuleReorder(src, targetIdx);
-  }
-  draggingRuleId.value = null;
-  dragOverRuleId.value = null;
-}
-
-function handleRuleDragEnd(): void {
-  draggingRuleId.value = null;
-  dragOverRuleId.value = null;
-}
+const {
+  draggingId: draggingRuleId,
+  dragOverId: dragOverRuleId,
+  dragOverPosition: dragOverRulePosition,
+  startDrag: startRuleDrag,
+  getCardDragStyle: getRuleDragStyle,
+} = usePointerCardDrag<string>({
+  containerRef: rulesGridRef,
+  onReorder: reorderRulesByPosition,
+});
 
 function onKeydown(event: KeyboardEvent): void {
   if (event.key === "Escape" && modalOpen.value) {
@@ -450,9 +491,9 @@ onUnmounted(() => {
     <div class="panel">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">Webhook 推送规则</h2>
+          <h2 class="panel-title">推送渠道设置</h2>
           <p class="panel-sub">
-            支持标准通用 JSON、飞书卡片、企业微信 Markdown、Discord Embed 与自定义模板（卡片支持折叠与拖曳排序）。
+            支持标准通用 JSON、飞书卡片、企业微信 Markdown、Discord Embed 与自定义模板（卡片支持折叠与按住 ≡ 拖曳排序，已登录账号多端同步）。
           </p>
         </div>
         <div class="inline-actions">
@@ -473,27 +514,33 @@ onUnmounted(() => {
     </div>
 
     <p v-if="!loading && orderedRules.length === 0" class="empty">
-      尚未配置任何 Webhook 规则，点击右上角「新增规则」创建推送渠道。
+      尚未配置任何推送规则，点击右上角「新增规则」创建推送渠道。
     </p>
 
-    <div v-else class="rules-grid">
+    <div
+      v-else
+      ref="rulesGridRef"
+      class="rules-grid"
+      :class="{ 'is-reordering': Boolean(draggingRuleId) }"
+    >
       <article
         v-for="(rule, idx) in orderedRules"
         :key="rule.id"
+        :data-drag-id="rule.id"
         class="rule-card"
+        :style="getRuleDragStyle(rule.id)"
         :class="{
           collapsed: collapsedRuleIds.has(rule.id),
           'is-dragging': draggingRuleId === rule.id,
-          'is-drag-over': dragOverRuleId === rule.id,
+          'is-drag-over-before': dragOverRuleId === rule.id && dragOverRulePosition === 'before',
+          'is-drag-over-after': dragOverRuleId === rule.id && dragOverRulePosition === 'after',
         }"
-        draggable="true"
-        @dragstart="handleRuleDragStart(rule.id, $event)"
-        @dragover.prevent="handleRuleDragOver(rule.id)"
-        @drop.prevent="handleRuleDrop(rule.id, $event)"
-        @dragend="handleRuleDragEnd"
       >
         <div>
-          <div class="rule-head">
+          <div
+            class="rule-head"
+            @pointerdown="startRuleDrag(rule.id, $event, { fromHandle: false })"
+          >
             <div class="rule-title-group">
               <strong class="rule-title">{{ rule.name }}</strong>
               <span class="pill info">{{ PROVIDER_LABELS[rule.provider_type] || rule.provider_type }}</span>
@@ -502,9 +549,15 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="card-controls">
-              <span class="card-tool-btn drag-handle" title="按住拖曳调整顺序" aria-label="拖曳排序">
+              <button
+                type="button"
+                class="card-tool-btn drag-handle"
+                title="按住拖动调整顺序"
+                aria-label="按住拖动排序"
+                @pointerdown.stop="startRuleDrag(rule.id, $event, { fromHandle: true })"
+              >
                 <GripVertical :size="13" aria-hidden="true" />
-              </span>
+              </button>
               <button
                 type="button"
                 class="card-tool-btn"
@@ -639,7 +692,8 @@ onUnmounted(() => {
     </div>
 
     <!-- 规则编辑弹窗 -->
-    <div v-if="modalOpen" class="modal-backdrop" @click.self="modalOpen = false">
+    <Transition name="holo-modal">
+      <div v-if="modalOpen" class="modal-backdrop" @click.self="modalOpen = false">
       <div
         class="modal-card"
         role="dialog"
@@ -647,7 +701,7 @@ onUnmounted(() => {
         aria-labelledby="webhook-modal-title"
       >
         <div class="modal-head">
-          <h3 id="webhook-modal-title">{{ editingId ? "编辑 Webhook 规则" : "新增 Webhook 规则" }}</h3>
+          <h3 id="webhook-modal-title">{{ editingId ? "编辑推送规则" : "新增推送规则" }}</h3>
           <button
             type="button"
             class="navbtn btn-icon"
@@ -821,5 +875,6 @@ onUnmounted(() => {
         </form>
       </div>
     </div>
+    </Transition>
   </section>
 </template>

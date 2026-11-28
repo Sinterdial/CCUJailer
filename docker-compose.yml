@@ -27,9 +27,15 @@ services:
       - OIDC_SCOPES=openid profile email
       - OIDC_AUTO_REGISTER=true
       - OIDC_DEFAULT_ROLE=user
+      # Passkey (WebAuthn) 配置，可在「账户设置 -> 安全与隐私」热更新；WebAuthn 要求 HTTPS 域名或 localhost
+      - PASSKEY_ENABLED=true
+      - PASSKEY_RP_NAME=CCUJailer
+      - PASSKEY_RP_ID=
+      - PASSKEY_ORIGIN=
+      # 首页默认筛选/排序与中文译源 URL 属于数据库动态配置，请在 Web UI（「系统设置 -> 全局设置」「系统设置 -> 中文译源」「账户设置 -> 个人偏好」）修改
       # 可选：脚本调用向后兼容静态令牌（留空仅使用用户账号/SSO）
       - ADMIN_TOKEN=
-      # 升级路线规划功能开关（默认关闭；可在「系统设置 -> 系统参数」中热切换）
+      # 升级路线规划功能开关（默认关闭；可在「系统设置 -> 全局设置」中热切换）
       - UPGRADE_PLANNER_ENABLED=false
       # 可选：出站代理配置（用于访问 RSI 商店或海外站点，需要使用时取消注释）
       # - HTTP_PROXY=http://host.docker.internal:7890

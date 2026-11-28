@@ -172,7 +172,7 @@ const layoutMetrics = computed(() => {
           </li>
         </ul>
         <p>
-          共 {{ layoutMetrics.grid.scu.toLocaleString("en-US") }} SCU{{ layoutMetrics.grid.concept ? "（概念设计布局）" : "" }}。箱格尺寸单位为宽 × 长 × 高（SCU），颜色越深代表可堆叠层数越高。
+          共 {{ layoutMetrics.grid.scu.toLocaleString("en-US") }} SCU{{ layoutMetrics.grid.concept ? "（画饼阶段布局）" : "" }}。箱格尺寸单位为宽 × 长 × 高（SCU），颜色越深代表可堆叠层数越高。
           <a :href="layoutMetrics.grid.viewer" target="_blank" rel="noopener">前往 sc-cargo.space 查看 3D 视图 ↗</a>
         </p>
       </figcaption>

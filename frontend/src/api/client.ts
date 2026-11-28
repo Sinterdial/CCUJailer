@@ -13,15 +13,21 @@ import type {
   InviteCodeItem,
   InviteCodeListResponse,
   LoginResponse,
+  PasskeyChallengeResponse,
+  PasskeyItem,
+  PasskeyListResponse,
   ShipI18nOverrideResponse,
   ShipListResponse,
   SsoAuthorizeResponse,
   StatusSummary,
+  TotpBackupCodesResponse,
+  TotpEnableResponse,
   TotpSetupResponse,
   UpgradeCostsResponse,
   UpgradePlanResponse,
   UserCreatePayload,
   UserListResponse,
+  UserPreferences,
   UserUpdatePayload,
   WebhookLogListResponse,
   WebhookRule,
@@ -251,10 +257,20 @@ export const apiClient = {
     return request<TotpSetupResponse>("/auth/otp/setup", { method: "POST" });
   },
 
-  enableTotp(otpCode: string): Promise<AuthUser> {
-    return request<AuthUser>("/auth/otp/enable", {
+  enableTotp(otpCode: string): Promise<TotpEnableResponse> {
+    return request<TotpEnableResponse>("/auth/otp/enable", {
       method: "POST",
       body: JSON.stringify({ otp_code: otpCode }),
+    });
+  },
+
+  regenerateTotpBackupCodes(payload: {
+    otp_code?: string;
+    current_password?: string;
+  }): Promise<TotpBackupCodesResponse> {
+    return request<TotpBackupCodesResponse>("/auth/otp/backup-codes/regenerate", {
+      method: "POST",
+      body: JSON.stringify(payload),
     });
   },
 
@@ -263,6 +279,76 @@ export const apiClient = {
       method: "POST",
       body: JSON.stringify(payload),
     });
+  },
+
+  getPreferences(): Promise<UserPreferences> {
+    return request<UserPreferences>("/auth/preferences");
+  },
+
+  updatePreferences(payload: Partial<UserPreferences>): Promise<UserPreferences> {
+    return request<UserPreferences>("/auth/preferences", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  listPasskeys(): Promise<PasskeyListResponse> {
+    return request<PasskeyListResponse>("/auth/passkeys");
+  },
+
+  beginPasskeyRegister(): Promise<PasskeyChallengeResponse> {
+    return request<PasskeyChallengeResponse>("/auth/passkeys/register/options", {
+      method: "POST",
+    });
+  },
+
+  verifyPasskeyRegister(payload: {
+    challenge_id: string;
+    name: string;
+    credential: Record<string, unknown>;
+  }): Promise<PasskeyItem> {
+    return request<PasskeyItem>("/auth/passkeys/register/verify", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  renamePasskey(passkeyId: number, name: string): Promise<PasskeyItem> {
+    return request<PasskeyItem>(`/auth/passkeys/${passkeyId}`, {
+      method: "PUT",
+      body: JSON.stringify({ name }),
+    });
+  },
+
+  deletePasskey(passkeyId: number): Promise<DeleteResponse> {
+    return request<DeleteResponse>(`/auth/passkeys/${passkeyId}`, {
+      method: "DELETE",
+    });
+  },
+
+  beginPasskeyLogin(username = ""): Promise<PasskeyChallengeResponse> {
+    return request<PasskeyChallengeResponse>(
+      "/auth/passkeys/login/options",
+      {
+        method: "POST",
+        body: JSON.stringify({ username }),
+      },
+      { skipUnauthorizedHook: true }
+    );
+  },
+
+  verifyPasskeyLogin(payload: {
+    challenge_id: string;
+    credential: Record<string, unknown>;
+  }): Promise<LoginResponse> {
+    return request<LoginResponse>(
+      "/auth/passkeys/login/verify",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { skipUnauthorizedHook: true }
+    );
   },
 
   listUsers(): Promise<UserListResponse> {

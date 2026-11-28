@@ -122,6 +122,8 @@ def _build_admin_token_principal() -> AuthenticatedUser:
         totp_enabled=False,
         has_password=False,
         oidc_bound=False,
+        passkey_count=0,
+        preferences={},
     )
 
 

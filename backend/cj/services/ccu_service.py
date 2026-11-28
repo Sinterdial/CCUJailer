@@ -825,13 +825,18 @@ class CcuService:
                             if store_match and not store_match.is_warbond
                             else 0
                         )
+                        maker_zh = self._i18n_service.resolve_manufacturer_zh(
+                            item.manufacturer, item.manufacturer_code
+                        )
                         ship = Ship(
                             key=item.key,
                             rsi_matrix_id=item.matrix_id,
                             name_en=item.name,
                             name_zh=zh_name,
                             auto_translated=auto_flag,
-                            search_index=build_search_index(item.name, zh_name, item.manufacturer),
+                            search_index=build_search_index(
+                                item.name, zh_name, item.manufacturer, maker_zh
+                            ),
                             manufacturer=item.manufacturer,
                             manufacturer_code=item.manufacturer_code,
                             focus=item.focus,
@@ -871,8 +876,18 @@ class CcuService:
                         if zh_name:
                             ship.name_zh = zh_name
                             ship.auto_translated = auto_flag
+                        elif ship.class_name:
+                            cls_res = self._i18n_service.resolve_local(
+                                ship.name_en, class_name=ship.class_name
+                            )
+                            if cls_res.name_zh:
+                                ship.name_zh = cls_res.name_zh
+                                ship.auto_translated = cls_res.auto_translated
+                        maker_zh = self._i18n_service.resolve_manufacturer_zh(
+                            ship.manufacturer, ship.manufacturer_code
+                        )
                         ship.search_index = build_search_index(
-                            ship.name_en, ship.name_zh, ship.manufacturer
+                            ship.name_en, ship.name_zh, ship.manufacturer, maker_zh
                         )
                         ship.always_available = is_always
                         ship.in_store = in_store
@@ -1683,6 +1698,20 @@ class CcuService:
                             ship.game_version = ig.game_version
                         if ig.class_name:
                             ship.class_name = ig.class_name
+                            resolved = self._i18n_service.resolve_local(
+                                ship.name_en, class_name=ship.class_name
+                            )
+                            if resolved.name_zh and (
+                                resolved.source in ("override", "cache") or not ship.name_zh
+                            ):
+                                ship.name_zh = resolved.name_zh
+                                ship.auto_translated = resolved.auto_translated
+                            maker_zh = self._i18n_service.resolve_manufacturer_zh(
+                                ship.manufacturer, ship.manufacturer_code
+                            )
+                            ship.search_index = build_search_index(
+                                ship.name_en, ship.name_zh, ship.manufacturer, maker_zh
+                            )
                         ship.claim_time_min = ig.claim_time_min
                         ship.expedite_time_min = ig.expedite_time_min
                         ship.expedite_cost_auec = ig.expedite_cost_auec

@@ -1,6 +1,6 @@
 [project]
 name = "ccujailer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Star Citizen CCU monitor with bilingual i18n, dual DB migration, and programmable webhook notifications."
 requires-python = ">=3.14"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
   "pyjwt[crypto]>=2.10.0",
   "pyotp>=2.9.0",
   "segno>=1.6.1",
+  "webauthn>=2.5.0",
 ]
 
 [dependency-groups]

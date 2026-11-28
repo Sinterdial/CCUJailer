@@ -10,6 +10,12 @@ import {
   refreshBootstrapState,
 } from "../composables/useAppStore";
 import type { ShipItem } from "../types/api";
+import {
+  DEFAULT_SCTOOLBOX_I18N_MIRROR_URL,
+  DEFAULT_SCTOOLBOX_I18N_URL,
+  formatManufacturer,
+  formatShipRoleZh,
+} from "../utils/localization";
 
 const loading = ref(false);
 const syncing = ref(false);
@@ -32,7 +38,7 @@ async function loadShips(): Promise<void> {
     });
     items.value = resp.items;
   } catch (err) {
-    notify(err instanceof Error ? err.message : "加载舰船词典失败", "error");
+    notify(err instanceof Error ? err.message : "加载中文译源失败", "error");
   } finally {
     loading.value = false;
   }
@@ -129,6 +135,10 @@ async function saveOverride(ship: ShipItem): Promise<void> {
   }
 }
 
+function useSourcePreset(url: string): void {
+  i18nSourceUrl.value = url;
+}
+
 onMounted(() => {
   void Promise.all([loadShips(), loadDictionarySettings()]);
 });
@@ -139,15 +149,15 @@ onMounted(() => {
     <div class="panel stack-md">
       <div class="panel-header">
         <div>
-          <h2 class="panel-title">舰船双语词典管理</h2>
+          <h2 class="panel-title">中文译源管理</h2>
           <p class="panel-sub">
-            支持配置远程词典源并同步社区词典或 global.ini，同时支持点击右侧「编辑」为特定舰船写入最高优先级人工译名（留空保存即恢复默认）。
+            支持配置远程中文译源（默认集成 StarCitizenToolBox 汉化仓 <code>global.ini</code>，按载具类名与短译名精准匹配，并同步厂商译名），同时支持点击右侧「编辑」为特定舰船写入最高优先级人工译名（留空保存即恢复默认）。
           </p>
         </div>
         <button type="button" class="navbtn" :disabled="syncing" @click="handleSyncI18n">
           <RefreshCw :size="14" :class="{ 'spin-icon': syncing }" aria-hidden="true" />
           <Languages :size="14" aria-hidden="true" />
-          {{ syncing ? "同步中…" : "同步远程词典" }}
+          {{ syncing ? "同步中…" : "同步远程译源" }}
         </button>
       </div>
 
@@ -158,15 +168,35 @@ onMounted(() => {
           type="url"
           autocomplete="off"
           spellcheck="false"
-          aria-label="远程汉化词典源 URL"
-          placeholder="远程汉化词典源 URL（支持 JSON 映射表或 StarCitizen global.ini）"
+          aria-label="远程中文译源 URL"
+          placeholder="远程中文译源 URL（支持 StarCitizenToolBox global.ini 或 JSON 映射表）"
           class="search-input"
         />
         <button type="submit" class="navbtn" :disabled="savingSource">
           <Save :size="14" aria-hidden="true" />
-          {{ savingSource ? "保存中…" : "保存词典源" }}
+          {{ savingSource ? "保存中…" : "保存译源" }}
         </button>
       </form>
+
+      <div class="source-presets">
+        <span class="muted small">快捷预设：</span>
+        <button
+          type="button"
+          class="navbtn btn-sm"
+          :class="{ primary: i18nSourceUrl.trim() === DEFAULT_SCTOOLBOX_I18N_URL }"
+          @click="useSourcePreset(DEFAULT_SCTOOLBOX_I18N_URL)"
+        >
+          StarCitizenToolBox 官方源 (GitHub)
+        </button>
+        <button
+          type="button"
+          class="navbtn btn-sm"
+          :class="{ primary: i18nSourceUrl.trim() === DEFAULT_SCTOOLBOX_I18N_MIRROR_URL }"
+          @click="useSourcePreset(DEFAULT_SCTOOLBOX_I18N_MIRROR_URL)"
+        >
+          StarCitizenToolBox 国内镜像 (scbox)
+        </button>
+      </div>
 
       <form class="bar" @submit.prevent="loadShips">
         <input
@@ -175,7 +205,7 @@ onMounted(() => {
           type="search"
           autocomplete="off"
           spellcheck="false"
-          aria-label="检索舰船词典"
+          aria-label="检索中文译源"
           placeholder="检索中文/英文名、制造商…"
           class="search-input"
         />
@@ -189,7 +219,7 @@ onMounted(() => {
           :aria-pressed="alwaysOnly"
           @click="alwaysOnly = !alwaysOnly; loadShips()"
         >
-          仅看常驻可买底船
+          仅看常驻可买可升级船
         </button>
         <span class="muted cell-meta mono">
           共 {{ items.length }} 艘舰船
@@ -198,7 +228,7 @@ onMounted(() => {
     </div>
 
     <div v-if="loading" class="panel muted panel-loading">
-      正在加载舰船词典…
+      正在加载中文译源…
     </div>
 
     <p v-else-if="items.length === 0" class="empty">
@@ -263,8 +293,8 @@ onMounted(() => {
               </template>
             </td>
             <td class="muted cell-meta">
-              {{ ship.manufacturer || "-" }}
-              <template v-if="ship.focus"> · {{ ship.focus }}</template>
+              {{ ship.manufacturer ? formatManufacturer(ship.manufacturer, "", appStore.languageMode) : "-" }}
+              <template v-if="ship.focus"> · {{ formatShipRoleZh(ship.focus) }}</template>
             </td>
             <td class="mono">{{ ship.value > 0 ? `$${ship.value}` : "-" }}</td>
             <td>

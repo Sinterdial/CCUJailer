@@ -2,15 +2,15 @@
 
 ## 1. 项目概述与改造目标
 
-**CCUJailer（简称 `cj`）** 基于开源项目 `DieLaughing/pledgewatch`（AGPL-3.0 协议）进行二次开发。在完整继承并复刻上游桌面与移动端阅读流体验（含全版本商店卡片、游戏内买租 aUEC 价格、实装版本、售卖规律、金牌标准、武器火力/DPS、历史价格、俯视货舱 SVG 网格以及 CCU 升级路线规划器）的基础上，重构为现代前后端分离架构，并新增**多用户认证体系（账密 + OTP + ZITADEL PKCE SSO）、双数据库引擎与平滑迁移、出口代理支持、中文化双语检索、可编程 Webhook 通知引擎**及**自动化 CI/CD 镜像发布流程**。
+**CCUJailer（简称 `cj`）** 基于开源项目 `DieLaughing/pledgewatch`（AGPL-3.0 协议）进行二次开发。在完整继承并复刻上游桌面与移动端阅读流体验（含全版本商店卡片、游戏内买租 aUEC 价格、可飞版本、售卖规律、金牌标准、武器火力/DPS、历史价格、俯视货舱 SVG 网格以及 CCU 升级路线规划器）的基础上，重构为现代前后端分离架构，并新增**多用户认证体系（账密 + OTP + Passkey 无密码登录 + OIDC PKCE）、账号绑定跨设备偏好同步、双数据库引擎与平滑迁移、出口代理支持、StarCitizenToolBox 中文译源流水线、可编程推送设置**及**自动化 CI/CD 镜像发布流程**。
 
 ### 核心需求清单
 1. **Docker 极简部署**：生产环境保持单容器（或极简 Compose）一键部署，数据持久化至挂载卷。
-2. **出口代理支持**：通过环境变量接管容器内所有出站请求（RSI 抓取、Wiki/UEX/GitHub 富化、OIDC Discovery/Token 交互、翻译源同步、Webhook 推送），支持 `NO_PROXY` CIDR 网段匹配。
-3. **Webhook 推送与过滤**：新 CCU 上架或降价时触发 HTTP 推送，支持按船名、原价、是否 WBCCU、优惠价等条件精准过滤与多平台卡片格式渲染。
-4. **船名中文化与双语支持**：自动同步/翻译船只中文名，支持人工在系统设置词典页逐船覆盖；前端全面支持「中英双语」「仅中文」「仅英文」切换。
-5. **全量商店体验与升级路线规划**：完整复刻 `pledgewatch` 桌面端与移动端界面，支持价格/版本/游戏内售价/性价比/主驾火力排序、完整 `Filters` 弹窗与底部滑出抽屉（含「我拥有的底船」实时向 RSI 核实补差价）与内置 CCU 省钱连跳规划器。
-6. **企业级身份认证与访问控制**：全站强制登录完全由服务端环境变量 `AUTH_REQUIRE_LOGIN` 控制（默认开启且 Web UI 不可修改），支持首次引导创建管理员或环境变量预设、Argon2id 本地账密、RFC 6238 TOTP 二步验证、ZITADEL OIDC PKCE 无 `client_secret` 公共客户端单点登录及基于角色（`admin` / `user`）的权限管控与用户管理。
+2. **出口代理支持**：通过环境变量接管容器内所有出站请求（RSI 抓取、Wiki/UEX/GitHub 富化、OIDC Discovery/Token 交互、中文译源同步、Webhook 推送），支持 `NO_PROXY` CIDR 网段匹配。
+3. **推送设置与过滤**：新 CCU 上架或降价时触发 HTTP 推送，支持按船名、原价、是否 WBCCU、优惠价等条件精准过滤与多平台卡片格式渲染。
+4. **船名与厂商中文译源流水线**：默认对接 StarCitizenToolBox 汉化仓 `global.ini`（含国内加速镜像预设），支持按载具类名与短译名自动匹配及厂商/定位/尺寸体型纯中文化展示，并允许在「系统设置 -> 中文译源」逐船人工覆盖；前端全面支持「中英双语」「仅中文」「仅英文」切换。
+5. **全量商店体验、专用补差计算与首页默认筛选**：完整复刻 `pledgewatch` 桌面端与移动端界面，支持价格/可飞版本/游戏内售价/性价比/主驾火力排序、专用「我需要补多少？」补差价计算弹窗（支持检索个人**可升级船**并实时向 RSI 核实差价）、全站与个人可配置的**首页默认筛选条件**（例如默认仅显示 `仅 WBCCU`），以及内置 CCU 省钱连跳规划器。
+6. **企业级身份认证与访问控制**：全站强制登录完全由服务端环境变量 `AUTH_REQUIRE_LOGIN` 控制（默认开启且 Web UI 不可修改），支持首个管理员引导创建或环境变量预设、Argon2id 本地账密、RFC 6238 TOTP 二步验证、**Passkey（WebAuthn / FIDO2）无密码通行密钥**、**OIDC PKCE** 无 `client_secret` 公共客户端单点登录、基于角色（`admin` / `user`）的权限管控及多端偏好同步（`users.preferences`）。
 7. **前后端分离与工程化**：前端独立 Vue 3 + Vite + TypeScript 工程，支持浅色 / 夜间 / 跟随系统三态切换，统一使用品牌图标（`favicon.svg`），并在界面展示 `CCUJailer` 服务版本号与 GitHub 项目主页入口。
 8. **双数据库与平滑迁移**：默认支持 SQLite 零配置运行，同时支持通过 `DATABASE_URL` 切换 PostgreSQL，配合防降级保护、并发锁与迁移前自动备份。
 
@@ -178,8 +178,8 @@
 * **可靠性机制**：内置 3 次指数退避重试；每次推送结果（HTTP 状态码、耗时、脱敏后的错误信息）写入数据库 `webhook_logs` 表，前端可查看推送历史并支持“发送测试通知”按钮；事件负载 `data["image_url"]` 自动附带舰船官方头图，其中 Discord Embed 自动挂载 `image` 预览图，自定义 JSON 模板支持 `{{image_url}}` 占位符。
 
 ### 3.5 数据库双引擎与平滑迁移设计（需求 8）
-彻底剥离原项目散落的原生 SQLite SQL 语句，统一收口至 **SQLAlchemy 2.0 ORM + Alembic**（已发布 `0001_initial_schema`、`0002_store_enrichment_and_auth`、`0003_invite_codes` 与 `0004_cleanup_abnormal_changelogs` 四阶段迁移，其中 `0004` 负责安全清理历史非 `$5` 倍数及批量税率纠偏产生的异常 `changelog` 记录）。
-* 新增业务数据表：`store_skus`（单船各版本与 Add-Ons 模块）、`upgrade_paths`（升级路线规划可达图邻接边）、`users`（多用户账号、Argon2id 密码、Fernet 密文 TOTP 密钥、OIDC 身份绑定与 `token_version`）、`oidc_states`（PKCE 临时防伪与防重放状态）、`invite_codes`（限时/限次邀请注册凭证表，支持绑定初始角色与启停控制）。
+彻底剥离原项目散落的原生 SQLite SQL 语句，统一收口至 **SQLAlchemy 2.0 ORM + Alembic**（已发布 `0001` 初始库表、`0002` 全量商店富化与认证、`0003` 邀请码表、`0004` 异常日志清理与 `0005_v020_user_prefs_and_passkeys` 五阶段迁移）。
+* 核心新增业务表与字段：`store_skus`、`upgrade_paths`、`users`（含 `preferences` JSON 跨终端同步偏好字段）、`oidc_states`、`invite_codes`、`user_passkeys`（WebAuthn 公钥/凭据 ID/签名计数器/备份与传输标识）与 `webauthn_challenges`（单次挑战与防重放）。
 
 ### 3.6 认证、用户管理、OTP 与 ZITADEL PKCE SSO 模块（需求 6）
 * **全站强制登录（仅环境变量 `AUTH_REQUIRE_LOGIN=true` 控制）**：未登录用户仅显示登录或首次初始化页；所有商店与规划 API 受 `require_site_access` 守卫保护；该项仅可通过 `.env` 或容器环境变量配置并重启生效，Web UI 仅作只读展示、禁止在线关闭。
@@ -241,14 +241,16 @@
 ### 后端 RESTful API 规范（前缀 `/api/v1`）
 | 方法 | 路径 | 权限 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/auth/status` | 公开 | 查询系统初始化状态、强制登录开关、注册模式、SSO 状态及当前登录用户 |
+| `GET` | `/api/v1/auth/status` | 公开 | 查询系统初始化状态、强制登录开关、注册模式、OIDC/Passkey 状态、首页默认筛选及当前用户与偏好 |
 | `POST` | `/api/v1/auth/setup` | 仅首次无用户 | 创建系统首个管理员账号并签发会话 Cookie/JWT |
 | `POST` | `/api/v1/auth/register` | 公开（受注册策略管控） | 根据当前 `registration_mode` 执行开放注册或校验有效邀请码后创建账号并登录 |
 | `POST` | `/api/v1/auth/login` | 公开 | 用户名密码登录（若启用 OTP 则返回 `mfa_required` + 挑战令牌） |
 | `POST` | `/api/v1/auth/login/otp` | 公开 | 提交 6 位 TOTP 口令完成二步验证 |
 | `POST` | `/api/v1/auth/logout` | 公开 | 清除会话 Cookie 退出登录 |
-| `GET` | `/api/v1/auth/sso/authorize` | 公开 | 生成 ZITADEL OIDC PKCE (S256 无 Secret) 授权跳转地址 |
+| `GET` | `/api/v1/auth/sso/authorize` | 公开 | 生成 OIDC PKCE (S256 无 Secret) 授权跳转地址 |
 | `POST` | `/api/v1/auth/sso/callback` | 公开 | 无密钥提交 `code` + `code_verifier` 换票、验签 ID Token 并完成登录 |
+| `GET/PUT` | `/api/v1/auth/preferences` | 已登录 | 读取或合并更新账号绑定的跨设备网站偏好与个人首页默认筛选 |
+| `GET/POST/PUT/DELETE` | `/api/v1/auth/passkeys*` | 公开/已登录 | Passkey 注册挑战/验证/重命名/删除与无密码登录验证流程 |
 | `GET` | `/api/v1/auth/me` | 已登录 | 获取当前账号详情 |
 | `PUT` | `/api/v1/auth/password` | 已登录 | 修改个人密码并递增 `token_version` 吊销旧会话 |
 | `POST` | `/api/v1/auth/otp/setup` | 已登录 | 生成待绑定 TOTP 密钥与本地内联 SVG 二维码 |

@@ -19,6 +19,43 @@ RegistrationMode = Literal["open", "invite_only", "closed"]
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = BACKEND_DIR.parent
 
+DEFAULT_SCTOOLBOX_I18N_URL = (
+    "https://raw.githubusercontent.com/StarCitizenToolBox/LocalizationData/"
+    "main/chinese_(simplified)/global.ini"
+)
+DEFAULT_SCTOOLBOX_I18N_MIRROR_URL = (
+    "https://git.scbox.xkeyc.cn/SCToolBox/LocalizationData/raw/branch/main/"
+    "chinese_(simplified)/global.ini"
+)
+
+VALID_STORE_FILTER_KEYS: tuple[str, ...] = (
+    "warbond",
+    "anniversary",
+    "lti",
+    "sale",
+    "limited",
+    "always",
+    "saleonly",
+    "deals",
+    "ccu",
+    "buyable",
+    "rentable",
+    "gold",
+    "concept",
+)
+
+VALID_STORE_SORT_KEYS: tuple[str, ...] = (
+    "price-desc",
+    "price-asc",
+    "released",
+    "name",
+    "size",
+    "game",
+    "game-desc",
+    "value",
+    "pilot",
+)
+
 
 class SystemConfigKey(StrEnum):
     """
@@ -31,6 +68,8 @@ class SystemConfigKey(StrEnum):
     CATALOG_SYNC_INTERVAL_SECONDS = "catalog_sync_interval_seconds"
     I18N_SOURCE_URL = "i18n_source_url"
     DEFAULT_LANGUAGE = "default_language"
+    DEFAULT_STORE_FILTERS = "default_store_filters"
+    DEFAULT_STORE_SORT = "default_store_sort"
     LOG_RETENTION_DAYS = "log_retention_days"
     TRANSLATE_ENABLED = "translate_enabled"
     TRANSLATE_API_BASE = "translate_api_base"
@@ -43,14 +82,20 @@ class SystemConfigKey(StrEnum):
     SSO_SCOPES = "sso_scopes"
     SSO_AUTO_REGISTER = "sso_auto_register"
     SSO_DEFAULT_ROLE = "sso_default_role"
+    PASSKEY_ENABLED = "passkey_enabled"
+    PASSKEY_RP_ID = "passkey_rp_id"
+    PASSKEY_RP_NAME = "passkey_rp_name"
+    PASSKEY_ORIGIN = "passkey_origin"
     UPGRADE_PLANNER_ENABLED = "upgrade_planner_enabled"
 
 
 DEFAULT_DYNAMIC_SETTINGS: dict[SystemConfigKey, str] = {
     SystemConfigKey.SCRAPE_INTERVAL_SECONDS: "300",
     SystemConfigKey.CATALOG_SYNC_INTERVAL_SECONDS: "86400",
-    SystemConfigKey.I18N_SOURCE_URL: "",
+    SystemConfigKey.I18N_SOURCE_URL: DEFAULT_SCTOOLBOX_I18N_URL,
     SystemConfigKey.DEFAULT_LANGUAGE: "bilingual",
+    SystemConfigKey.DEFAULT_STORE_FILTERS: "[]",
+    SystemConfigKey.DEFAULT_STORE_SORT: "price-desc",
     SystemConfigKey.LOG_RETENTION_DAYS: "30",
     SystemConfigKey.TRANSLATE_ENABLED: "false",
     SystemConfigKey.TRANSLATE_API_BASE: "https://api.openai.com/v1",
@@ -63,6 +108,10 @@ DEFAULT_DYNAMIC_SETTINGS: dict[SystemConfigKey, str] = {
     SystemConfigKey.SSO_SCOPES: "openid profile email",
     SystemConfigKey.SSO_AUTO_REGISTER: "true",
     SystemConfigKey.SSO_DEFAULT_ROLE: "user",
+    SystemConfigKey.PASSKEY_ENABLED: "true",
+    SystemConfigKey.PASSKEY_RP_ID: "",
+    SystemConfigKey.PASSKEY_RP_NAME: "CCUJailer",
+    SystemConfigKey.PASSKEY_ORIGIN: "",
     SystemConfigKey.UPGRADE_PLANNER_ENABLED: "false",
 }
 
@@ -168,6 +217,22 @@ class Settings(BaseSettings):
     oidc_default_role: UserRole = Field(
         default="user",
         description="SSO 自动注册账号默认角色（user/admin）",
+    )
+    passkey_enabled: bool = Field(
+        default=True,
+        description="Passkey 通行密钥登录默认启用状态（可被系统设置热更新覆盖）",
+    )
+    passkey_rp_id: str = Field(
+        default="",
+        description="Passkey 依赖方域名 RP ID（留空时按当前访问域名自动识别）",
+    )
+    passkey_rp_name: str = Field(
+        default="CCUJailer",
+        description="Passkey 站点展示名称默认值",
+    )
+    passkey_origin: str = Field(
+        default="",
+        description="Passkey 允许来源 Origin（多个用逗号分隔；留空按请求自动推导）",
     )
     upgrade_planner_enabled: bool = Field(
         default=False,

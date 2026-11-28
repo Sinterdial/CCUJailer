@@ -180,7 +180,7 @@ async def test_0004_migration_cleans_abnormal_price_changelogs_and_keeps_valid_r
 
     with closing(sqlite3.connect(str(db_file))) as conn:
         ver = conn.execute("SELECT version_num FROM alembic_version").fetchall()
-        assert ver == [("0004_cleanup_abnormal_changelogs",)]
+        assert ver == [("0006_v020_totp_backup_codes",)]
         rows = conn.execute(
             """SELECT event_type, old_price_cents, new_price_cents
                FROM changelog ORDER BY id"""
@@ -192,3 +192,89 @@ async def test_0004_migration_cleans_abnormal_price_changelogs_and_keeps_valid_r
 
     backups = list((data_dir / "backups").glob("ccujailer_*.db"))
     assert len(backups) == 1
+
+
+async def test_0005_migration_adds_user_prefs_and_passkeys_tables(tmp_path: Path) -> None:
+    """
+    验证从 0004 升级至 0005 时，保留现有 users 数据并新增 preferences 字段、
+    user_passkeys 表与 webauthn_challenges 表。
+    """
+    data_dir = tmp_path / "data_0005"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_file = data_dir / "v020_upgrade_test.db"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{db_file.as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+    )
+
+    cfg = _build_alembic_config(settings)
+    await asyncio.to_thread(command.upgrade, cfg, "0004_cleanup_abnormal_changelogs")
+
+    with closing(sqlite3.connect(str(db_file))) as conn:
+        conn.execute(
+            """INSERT INTO users (username, display_name, email, password_hash, role,
+               is_active, totp_secret_encrypted, totp_enabled, oidc_sub, token_version,
+               created_at, updated_at)
+               VALUES ('legacy_pilot', '老玩家', 'pilot@test.local', 'hash', 'admin',
+               1, '', 0, NULL, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"""
+        )
+        conn.commit()
+
+    await run_migrations_async(settings)
+
+    with closing(sqlite3.connect(str(db_file))) as conn:
+        ver = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+        assert ver == [("0006_v020_totp_backup_codes",)]
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert {"user_passkeys", "webauthn_challenges"} <= tables
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        assert {"preferences", "totp_backup_codes"} <= cols
+        user_row = conn.execute(
+            "SELECT username, preferences FROM users WHERE username='legacy_pilot'"
+        ).fetchone()
+        assert user_row is not None
+        assert user_row[0] == "legacy_pilot"
+        assert user_row[1] == "{}"
+
+
+async def test_0006_migration_adds_totp_backup_codes(tmp_path: Path) -> None:
+    """
+    验证从 0005 升级至 0006 时，保留现有用户并在 users 表新增 totp_backup_codes 默认空数组列。
+    """
+    data_dir = tmp_path / "data_0006"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_file = data_dir / "v020_0006_test.db"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{db_file.as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+    )
+
+    cfg = _build_alembic_config(settings)
+    await asyncio.to_thread(command.upgrade, cfg, "0005_v020_user_prefs_and_passkeys")
+
+    with closing(sqlite3.connect(str(db_file))) as conn:
+        conn.execute(
+            """INSERT INTO users (username, display_name, email, password_hash, role,
+               is_active, totp_secret_encrypted, totp_enabled, oidc_sub, token_version,
+               preferences, created_at, updated_at)
+               VALUES ('pilot_0005', 'Pilot', 'p@test.local', 'hash', 'user',
+               1, '', 0, NULL, 1, '{}', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"""
+        )
+        conn.commit()
+
+    await run_migrations_async(settings)
+
+    with closing(sqlite3.connect(str(db_file))) as conn:
+        ver = conn.execute("SELECT version_num FROM alembic_version").fetchall()
+        assert ver == [("0006_v020_totp_backup_codes",)]
+        row = conn.execute(
+            "SELECT username, totp_backup_codes FROM users WHERE username='pilot_0005'"
+        ).fetchone()
+        assert row == ("pilot_0005", "[]")

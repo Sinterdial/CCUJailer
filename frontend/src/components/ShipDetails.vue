@@ -1,67 +1,82 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, GripVertical } from "lucide-vue-next";
+import { computed, ref, watch } from "vue";
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  ChevronUp,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  GripVertical,
+  RotateCcw,
+} from "lucide-vue-next";
 import CargoGridSvg from "./CargoGridSvg.vue";
 import {
+  DEFAULT_DETAIL_CARD_ORDER,
   appStore,
   formatAuec,
   formatHoursLabel,
   formatShipDisplay,
   moneyFromCents,
+  updateUserPreferences,
 } from "../composables/useAppStore";
+import { usePointerCardDrag } from "../composables/usePointerCardDrag";
 import type { StoreShip } from "../types/api";
 
 type DetailCardId = "ingame" | "insurance" | "weapons" | "loadouts" | "donors" | "history" | "cargo";
 
 const DETAILS_ORDER_KEY = "ccujailer_details_card_order";
 const DETAILS_COLLAPSED_KEY = "ccujailer_details_collapsed_cards";
-const DEFAULT_CARD_ORDER: DetailCardId[] = [
-  "ingame",
-  "insurance",
-  "weapons",
-  "loadouts",
-  "donors",
-  "history",
-  "cargo",
-];
+const DEFAULT_CARD_ORDER: DetailCardId[] = [...DEFAULT_DETAIL_CARD_ORDER] as DetailCardId[];
 const PAIRABLE_CARDS = new Set<DetailCardId>(["ingame", "insurance"]);
 const CARD_TITLES: Record<DetailCardId, string> = {
   ingame: "游戏内获取",
-  insurance: "保险与借用船",
+  insurance: "保险与当前借船",
   weapons: "原厂武器配置",
   loadouts: "配装模拟 (Erkul)",
-  donors: "最近可升级起始底船推荐 (CCU)",
+  donors: "最近可升级船推荐 (CCU)",
   history: "历史商店售价记录",
   cargo: "俯视货舱网格",
 };
 
+function normalizeOrderList(list: unknown): DetailCardId[] {
+  if (!Array.isArray(list) || list.length === 0) {
+    return [...DEFAULT_CARD_ORDER];
+  }
+  const valid = list.filter(
+    (id): id is DetailCardId =>
+      typeof id === "string" && DEFAULT_CARD_ORDER.includes(id as DetailCardId)
+  );
+  const seen = new Set(valid);
+  for (const def of DEFAULT_CARD_ORDER) {
+    if (!seen.has(def)) {
+      valid.push(def);
+    }
+  }
+  return valid;
+}
+
 function loadDetailCardOrder(): DetailCardId[] {
+  if (appStore.userPreferences.details_card_order?.length) {
+    return normalizeOrderList(appStore.userPreferences.details_card_order);
+  }
   try {
     const raw = localStorage.getItem(DETAILS_ORDER_KEY);
-    if (!raw) {
-      return [...DEFAULT_CARD_ORDER];
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [...DEFAULT_CARD_ORDER];
-    }
-    const valid = parsed.filter(
-      (id): id is DetailCardId =>
-        typeof id === "string" && DEFAULT_CARD_ORDER.includes(id as DetailCardId)
-    );
-    const seen = new Set(valid);
-    for (const def of DEFAULT_CARD_ORDER) {
-      if (!seen.has(def)) {
-        valid.push(def);
-      }
-    }
-    return valid;
+    return raw ? normalizeOrderList(JSON.parse(raw)) : [...DEFAULT_CARD_ORDER];
   } catch {
     return [...DEFAULT_CARD_ORDER];
   }
 }
 
 function loadCollapsedCards(): Set<DetailCardId> {
+  if (appStore.authStatus.authenticated && Array.isArray(appStore.userPreferences.details_collapsed_cards)) {
+    return new Set(
+      appStore.userPreferences.details_collapsed_cards.filter(
+        (id): id is DetailCardId =>
+          typeof id === "string" && DEFAULT_CARD_ORDER.includes(id as DetailCardId)
+      )
+    );
+  }
   try {
     const raw = localStorage.getItem(DETAILS_COLLAPSED_KEY);
     if (!raw) {
@@ -98,10 +113,17 @@ const props = defineProps<{
 
 const rentOpen = ref(false);
 const showAllHistory = ref(false);
+const detailsContainerRef = ref<HTMLElement | null>(null);
 const cardOrder = ref<DetailCardId[]>(loadDetailCardOrder());
 const collapsedCards = ref<Set<DetailCardId>>(loadCollapsedCards());
-const draggingCardId = ref<DetailCardId | null>(null);
-const dragOverCardId = ref<DetailCardId | null>(null);
+
+watch(
+  () => appStore.preferencesSyncVersion,
+  () => {
+    cardOrder.value = loadDetailCardOrder();
+    collapsedCards.value = loadCollapsedCards();
+  }
+);
 
 const MOUNT_LABELS: Record<string, string> = {
   hardpoints: "固定挂载点",
@@ -189,7 +211,7 @@ const goldText = computed(() => {
   }
   const fam = g.family ? `（${g.family} 系列）` : "";
   return g.status === "done"
-    ? `已完成金牌标准（Gold Standard）重制${fam}${g.patch ? ` · 实装于 ${g.patch}` : ""}`
+    ? `已完成金牌标准（Gold Standard）重制${fam}${g.patch ? ` · 可飞于 ${g.patch}` : ""}`
     : `金牌标准（Gold Standard）重制进行中${fam}`;
 });
 
@@ -325,22 +347,17 @@ function toggleCardCollapse(cardId: DetailCardId): void {
     next.add(cardId);
   }
   collapsedCards.value = next;
-  saveDetailStorage(DETAILS_COLLAPSED_KEY, [...next]);
+  const list = [...next];
+  saveDetailStorage(DETAILS_COLLAPSED_KEY, list);
+  void updateUserPreferences({ details_collapsed_cards: list });
 }
 
 function toggleCollapseAllCards(): void {
-  const next = new Set(collapsedCards.value);
-  if (allCardsCollapsed.value) {
-    for (const id of orderedVisibleCards.value) {
-      next.delete(id);
-    }
-  } else {
-    for (const id of orderedVisibleCards.value) {
-      next.add(id);
-    }
-  }
+  const next = allCardsCollapsed.value ? new Set<DetailCardId>() : new Set<DetailCardId>(DEFAULT_CARD_ORDER);
   collapsedCards.value = next;
-  saveDetailStorage(DETAILS_COLLAPSED_KEY, [...next]);
+  const list = [...next];
+  saveDetailStorage(DETAILS_COLLAPSED_KEY, list);
+  void updateUserPreferences({ details_collapsed_cards: list });
 }
 
 function applyCardReorder(sourceId: DetailCardId, targetVisibleIdx: number): void {
@@ -362,6 +379,7 @@ function applyCardReorder(sourceId: DetailCardId, targetVisibleIdx: number): voi
   const merged = [...visible, ...hiddenTail];
   cardOrder.value = merged;
   saveDetailStorage(DETAILS_ORDER_KEY, merged);
+  void updateUserPreferences({ details_card_order: merged });
 }
 
 function moveCard(cardId: DetailCardId, direction: -1 | 1): void {
@@ -374,53 +392,75 @@ function moveCard(cardId: DetailCardId, direction: -1 | 1): void {
 function resetCardOrder(): void {
   cardOrder.value = [...DEFAULT_CARD_ORDER];
   saveDetailStorage(DETAILS_ORDER_KEY, DEFAULT_CARD_ORDER);
+  void updateUserPreferences({ details_card_order: [...DEFAULT_CARD_ORDER] });
 }
 
-function handleCardDragStart(cardId: DetailCardId, event: DragEvent): void {
-  draggingCardId.value = cardId;
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", cardId);
-  }
-}
-
-function handleCardDragOver(cardId: DetailCardId): void {
-  if (draggingCardId.value && draggingCardId.value !== cardId) {
-    dragOverCardId.value = cardId;
-  }
-}
-
-function handleCardDrop(targetId: DetailCardId, event: DragEvent): void {
-  const raw = draggingCardId.value || event.dataTransfer?.getData("text/plain") || "";
-  if (!DEFAULT_CARD_ORDER.includes(raw as DetailCardId)) {
-    draggingCardId.value = null;
-    dragOverCardId.value = null;
+function reorderCardsByPosition(
+  sourceId: DetailCardId,
+  targetId: DetailCardId,
+  position: "before" | "after"
+): void {
+  const visible = orderedVisibleCards.value.slice();
+  const fromIdx = visible.indexOf(sourceId);
+  if (fromIdx === -1) {
     return;
   }
-  const targetIdx = orderedVisibleCards.value.indexOf(targetId);
-  if (targetIdx !== -1) {
-    applyCardReorder(raw as DetailCardId, targetIdx);
+  const [moved] = visible.splice(fromIdx, 1);
+  const targetIdx = visible.indexOf(targetId);
+  if (targetIdx === -1) {
+    return;
   }
-  draggingCardId.value = null;
-  dragOverCardId.value = null;
+  const insertIdx = position === "before" ? targetIdx : targetIdx + 1;
+  visible.splice(insertIdx, 0, moved);
+
+  const visibleSet = new Set(visible);
+  const hiddenTail = cardOrder.value.filter((id) => !visibleSet.has(id));
+  const merged = [...visible, ...hiddenTail];
+  cardOrder.value = merged;
+  saveDetailStorage(DETAILS_ORDER_KEY, merged);
+  void updateUserPreferences({ details_card_order: merged });
 }
 
-function handleCardDragEnd(): void {
-  draggingCardId.value = null;
-  dragOverCardId.value = null;
-}
+const {
+  draggingId: draggingCardId,
+  dragOverId: dragOverCardId,
+  dragOverPosition: dragOverCardPosition,
+  startDrag: startCardDrag,
+  getCardDragStyle,
+} = usePointerCardDrag<DetailCardId>({
+  containerRef: detailsContainerRef,
+  onReorder: reorderCardsByPosition,
+});
 </script>
 
 <template>
-  <div class="details">
+  <div
+    ref="detailsContainerRef"
+    class="details"
+    :class="{ 'is-reordering': Boolean(draggingCardId) }"
+  >
     <div class="details-toolbar">
-      <span class="details-toolbar-hint">卡片支持折叠与拖曳/上下调整顺序（自动保存偏好）</span>
+      <span class="details-toolbar-hint">按住 ≡ 手柄拖动或点 ↑↓ 调整顺序（已登录账号自动多端同步）</span>
       <div class="details-toolbar-actions">
-        <button type="button" class="link" @click="toggleCollapseAllCards">
-          {{ allCardsCollapsed ? "全部展开" : "全部折叠" }}
+        <button
+          type="button"
+          class="card-tool-btn details-icon-btn"
+          :title="allCardsCollapsed ? '全部展开' : '全部折叠'"
+          :aria-label="allCardsCollapsed ? '全部展开' : '全部折叠'"
+          @click="toggleCollapseAllCards"
+        >
+          <ChevronsUpDown v-if="allCardsCollapsed" :size="14" aria-hidden="true" />
+          <ChevronsDownUp v-else :size="14" aria-hidden="true" />
         </button>
-        <button v-if="hasCustomCardOrder" type="button" class="link" @click="resetCardOrder">
-          恢复默认顺序
+        <button
+          v-if="hasCustomCardOrder"
+          type="button"
+          class="card-tool-btn details-icon-btn"
+          title="恢复默认排序"
+          aria-label="恢复默认排序"
+          @click="resetCardOrder"
+        >
+          <RotateCcw :size="13" aria-hidden="true" />
         </button>
       </div>
     </div>
@@ -430,25 +470,34 @@ function handleCardDragEnd(): void {
       :key="cardId"
       class="detail-card"
       :data-card-id="cardId"
+      :data-drag-id="cardId"
+      :style="[{ '--detail-idx': Math.min(idx, 7) }, getCardDragStyle(cardId)]"
       :class="{
         wide: wideCardSet.has(cardId),
         loadouts: cardId === 'loadouts',
         collapsed: collapsedCards.has(cardId),
         'is-dragging': draggingCardId === cardId,
-        'is-drag-over': dragOverCardId === cardId,
+        'is-drag-over-before': dragOverCardId === cardId && dragOverCardPosition === 'before',
+        'is-drag-over-after': dragOverCardId === cardId && dragOverCardPosition === 'after',
       }"
-      draggable="true"
-      @dragstart="handleCardDragStart(cardId, $event)"
-      @dragover.prevent="handleCardDragOver(cardId)"
-      @drop.prevent="handleCardDrop(cardId, $event)"
-      @dragend="handleCardDragEnd"
     >
-      <div class="detail-card-head">
-        <h3>{{ CARD_TITLES[cardId] }}</h3>
+      <div
+        class="detail-card-head"
+        @pointerdown="startCardDrag(cardId, $event, { fromHandle: false })"
+      >
+        <div class="detail-card-title-group">
+          <button
+            type="button"
+            class="card-tool-btn drag-handle"
+            title="按住拖动调整顺序"
+            aria-label="按住拖动排序"
+            @pointerdown.stop="startCardDrag(cardId, $event, { fromHandle: true })"
+          >
+            <GripVertical :size="13" aria-hidden="true" />
+          </button>
+          <h3>{{ CARD_TITLES[cardId] }}</h3>
+        </div>
         <div class="card-controls">
-          <span class="card-tool-btn drag-handle" title="拖曳调整卡片顺序" aria-hidden="true">
-            <GripVertical :size="12" aria-hidden="true" />
-          </span>
           <button
             type="button"
             class="card-tool-btn"
@@ -478,7 +527,7 @@ function handleCardDragEnd(): void {
           >
             <ChevronDown v-if="collapsedCards.has(cardId)" :size="12" aria-hidden="true" />
             <ChevronUp v-else :size="12" aria-hidden="true" />
-            <span>{{ collapsedCards.has(cardId) ? "展开" : "折叠" }}</span>
+            <span class="card-tool-label">{{ collapsedCards.has(cardId) ? "展开" : "折叠" }}</span>
           </button>
         </div>
       </div>
@@ -588,7 +637,7 @@ function handleCardDragEnd(): void {
             </template>
             <template v-else>
               <dt>索赔时间</dt>
-              <dd class="muted">暂无数据（未实装或暂无游戏内配置）</dd>
+              <dd class="muted">暂无数据（画饼中或暂无游戏内配置）</dd>
             </template>
 
             <template v-if="storeInsuranceText">
@@ -596,7 +645,7 @@ function handleCardDragEnd(): void {
               <dd>{{ storeInsuranceText }}</dd>
             </template>
             <template v-if="ship.loaners">
-              <dt>借用替代船</dt>
+              <dt>当前借船</dt>
               <dd>{{ ship.loaners }}</dd>
             </template>
           </dl>
@@ -714,22 +763,22 @@ function handleCardDragEnd(): void {
           </div>
         </template>
 
-        <!-- 5. 最近可升级起始底船（CCU 起跳推荐） -->
+        <!-- 5. 最近可升级船（CCU 起跳推荐） -->
         <template v-else-if="cardId === 'donors'">
           <div class="stack-md">
             <div v-for="up in upgradeDonors" :key="up.sku" class="stack-sm">
               <div class="row-between">
                 <strong>
                   {{ up.label }} · {{ moneyFromCents(up.price) }}
-                  <span v-if="up.is_warbond" class="pill warn pill-inline">Warbond</span>
+                  <span v-if="up.is_warbond" class="pill warn pill-inline">WBCCU</span>
                 </strong>
-                <span class="muted small">推荐从下方最接近价值底船升级至此 SKU</span>
+                <span class="muted small">推荐从下方最接近价值的可升级船升级至此 SKU</span>
               </div>
               <div class="table-wrap">
                 <table class="hist">
                   <thead>
                     <tr>
-                      <th>起始底船</th>
+                      <th>可升级船</th>
                       <th class="num">当前估值</th>
                       <th class="num">需补差价</th>
                       <th>商店属性</th>

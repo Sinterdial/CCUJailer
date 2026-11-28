@@ -254,3 +254,80 @@ def decrypt_secret(ciphertext: str, master_key: str) -> str:
         return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError) as exc:
         raise ValueError("Failed to decrypt stored secret") from exc
+
+
+_BACKUP_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+
+def normalize_backup_code(code: str) -> str:
+    """
+    标准化用户输入的 TOTP 备用恢复码（去除空格与连字符并转大写）。
+
+    @param code: 用户输入的原始备用码文本
+    @return: 连续大写字母数字串
+    """
+    return re.sub(r"[^A-Za-z0-9]", "", code).upper()
+
+
+def generate_totp_backup_codes(count: int = 8) -> list[str]:
+    """
+    生成指定数量格式为 XXXX-XXXX 的高熵一次性 TOTP 备用恢复码。
+
+    @param count: 生成数量，默认 8 个
+    @return: 格式化明文备用码列表
+    """
+    codes: list[str] = []
+    seen: set[str] = set()
+    while len(codes) < count:
+        raw = "".join(secrets.choice(_BACKUP_CODE_ALPHABET) for _ in range(8))
+        if raw in seen:
+            continue
+        seen.add(raw)
+        codes.append(f"{raw[:4]}-{raw[4:]}")
+    return codes
+
+
+def hash_backup_code(user_id: int, code: str, master_key: str) -> str:
+    """
+    使用应用主密钥计算绑定到指定用户的备用恢复码 HMAC-SHA256 摘要。
+
+    @param user_id: 用户主键 ID
+    @param code: 原始或标准化备用恢复码
+    @param master_key: 应用主密钥
+    @return: 十六进制哈希摘要字符串
+    """
+    normalized = normalize_backup_code(code)
+    message = f"totp-backup:{user_id}:{normalized}".encode()
+    return hmac.new(master_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def match_and_consume_backup_code(
+    user_id: int,
+    code: str,
+    stored_hashes: list[str],
+    master_key: str,
+) -> tuple[bool, list[str]]:
+    """
+    常量时间核验一次性备用恢复码；命中后从存储列表中消耗移除该条目。
+
+    @param user_id: 用户主键 ID
+    @param code: 用户提交的备用恢复码
+    @param stored_hashes: 数据库存储的备用码哈希列表
+    @param master_key: 应用主密钥
+    @return: (是否命中匹配, 消耗后的剩余哈希列表)
+    """
+    normalized = normalize_backup_code(code)
+    if len(normalized) < 8 or not stored_hashes:
+        return False, list(stored_hashes)
+
+    candidate_hash = hash_backup_code(user_id, normalized, master_key)
+    matched_idx = -1
+    for idx, stored in enumerate(stored_hashes):
+        if isinstance(stored, str) and hmac.compare_digest(stored, candidate_hash):
+            if matched_idx == -1:
+                matched_idx = idx
+
+    if matched_idx == -1:
+        return False, list(stored_hashes)
+    remaining = [h for idx, h in enumerate(stored_hashes) if idx != matched_idx]
+    return True, remaining

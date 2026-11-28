@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 
 from cj.core.config import Settings
-from cj.db.models import Ship
+from cj.db.models import Changelog, Ship
 from main import create_app
 
 
@@ -280,3 +280,143 @@ async def test_api_upgrade_planner_feature_toggle(tmp_path: Path) -> None:
             allowed_plan = await client.get("/api/v1/plan")
             assert allowed_plan.status_code == 200
             assert "ships" in allowed_plan.json()
+
+
+async def test_api_default_store_filters_and_passkey_settings(tmp_path: Path) -> None:
+    """
+    验证管理员可配置全局首页默认筛选/排序及 Passkey 设置，并在 /auth/status 正确下发。
+    """
+    data_dir = tmp_path / "data_settings"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{(data_dir / 'settings_v020.db').as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+        enable_scheduler=False,
+        admin_token="",
+        frontend_dist_dir=tmp_path / "no_dist",
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            setup_res = await client.post(
+                "/api/v1/auth/setup",
+                json={"username": "admin", "password": "StrongPassword123"},
+            )
+            assert setup_res.status_code == 201
+
+            # 1. 非法筛选键或排序键应返回 422
+            bad_cfg = await client.put(
+                "/api/v1/settings",
+                json={"default_store_filters": ["invalid_key"]},
+            )
+            assert bad_cfg.status_code == 422
+
+            # 2. 设置默认仅显示仅 WBCCU + 按可飞版本排序 + 自定义 Passkey 参数
+            updated = await client.put(
+                "/api/v1/settings",
+                json={
+                    "default_store_filters": ["deals"],
+                    "default_store_sort": "released",
+                    "passkey_enabled": False,
+                    "passkey_rp_name": "MyFleet",
+                    "passkey_rp_id": "fleet.example.com",
+                    "passkey_origin": "https://fleet.example.com",
+                },
+            )
+            assert updated.status_code == 200
+            cfg = updated.json()
+            assert cfg["default_store_filters"] == ["deals"]
+            assert cfg["default_store_sort"] == "released"
+            assert cfg["passkey_enabled"] is False
+            assert cfg["passkey_rp_name"] == "MyFleet"
+            assert cfg["passkey_rp_id"] == "fleet.example.com"
+
+            # 3. /auth/status 同步体现全局默认与版本号 0.2.0
+            auth_st = (await client.get("/api/v1/auth/status")).json()
+            assert auth_st["default_store_filters"] == ["deals"]
+            assert auth_st["default_store_sort"] == "released"
+            assert auth_st["passkey_enabled"] is False
+            assert auth_st["app_version"] == "0.2.0"
+
+
+async def test_api_changelog_wbccu_and_ship_delisted_filters(tmp_path: Path) -> None:
+    """
+    验证 /api/v1/changelog 对 ccu.wb_delisted（WBCCU 下架）、ccu.standard_delisted
+    与 store.gone（整船下架）的精确分类筛选。
+    """
+    data_dir = tmp_path / "data_changelog"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{(data_dir / 'changelog_filter.db').as_posix()}",
+        data_dir=data_dir,
+        auto_migrate=True,
+        enable_scheduler=False,
+        admin_token="",
+        frontend_dist_dir=tmp_path / "no_dist",
+    )
+    app = create_app(settings)
+
+    async with app.router.lifespan_context(app):
+        async with app.state.container.session_factory() as session:
+            async with session.begin():
+                session.add_all(
+                    [
+                        Changelog(
+                            event_type="ccu.delisted",
+                            sku_id=101,
+                            ship_name_en="Zeus Mk II ES",
+                            ship_name_zh="宙斯 Mk II ES",
+                            edition_label="Warbond",
+                            is_warbond=True,
+                            old_price_cents=16000,
+                        ),
+                        Changelog(
+                            event_type="ccu.delisted",
+                            sku_id=102,
+                            ship_name_en="Corsair",
+                            ship_name_zh="海盗船",
+                            edition_label="Standard",
+                            is_warbond=False,
+                            old_price_cents=25000,
+                        ),
+                        Changelog(
+                            event_type="store.gone",
+                            sku_id=0,
+                            ship_name_en="Polaris",
+                            ship_name_zh="北极星",
+                            edition_label="10 Year",
+                            is_warbond=False,
+                            old_price_cents=97500,
+                        ),
+                    ]
+                )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(
+                "/api/v1/auth/setup",
+                json={"username": "admin", "password": "StrongPassword123"},
+            )
+
+            wb_res = (
+                await client.get("/api/v1/changelog", params={"event_type": "ccu.wb_delisted"})
+            ).json()
+            assert wb_res["total"] == 1
+            assert wb_res["items"][0]["ship_name_en"] == "Zeus Mk II ES"
+
+            std_res = (
+                await client.get(
+                    "/api/v1/changelog", params={"event_type": "ccu.standard_delisted"}
+                )
+            ).json()
+            assert std_res["total"] == 1
+            assert std_res["items"][0]["ship_name_en"] == "Corsair"
+
+            gone_res = (
+                await client.get("/api/v1/changelog", params={"event_type": "store.gone"})
+            ).json()
+            assert gone_res["total"] == 1
+            assert gone_res["items"][0]["ship_name_en"] == "Polaris"

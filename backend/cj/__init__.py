@@ -11,5 +11,5 @@ GITHUB_REPO_URL = "https://github.com/Sinterdial/CCUJailer"
 try:
     APP_VERSION = version("ccujailer")
 except PackageNotFoundError:
-    APP_VERSION = "0.1.0"
+    APP_VERSION = "0.2.0"
 

@@ -9,7 +9,7 @@ from datetime import datetime
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cj.db.models import InviteCode, OidcState, User
+from cj.db.models import InviteCode, OidcState, User, UserPasskey, WebAuthnChallenge
 
 
 class UserRepository:
@@ -207,3 +207,145 @@ class UserRepository:
         """
         await session.delete(invite)
         await session.flush()
+
+    async def list_passkeys_by_user(
+        self,
+        session: AsyncSession,
+        user_id: int,
+    ) -> list[UserPasskey]:
+        """
+        查询指定用户已绑定的全部 Passkey 通行密钥列表。
+
+        @param session: 异步数据库会话
+        @param user_id: 用户主键 ID
+        @return: 按创建时间升序排列的 UserPasskey 列表
+        """
+        stmt = (
+            select(UserPasskey)
+            .where(UserPasskey.user_id == user_id)
+            .order_by(UserPasskey.id.asc())
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_passkeys_by_users(
+        self,
+        session: AsyncSession,
+        user_ids: list[int],
+    ) -> dict[int, int]:
+        """
+        批量统计多位用户的已绑定 Passkey 数量。
+
+        @param session: 异步数据库会话
+        @param user_ids: 用户主键 ID 列表
+        @return: {user_id: passkey_count} 映射字典
+        """
+        if not user_ids:
+            return {}
+        stmt = (
+            select(UserPasskey.user_id, func.count(UserPasskey.id))
+            .where(UserPasskey.user_id.in_(user_ids))
+            .group_by(UserPasskey.user_id)
+        )
+        rows = (await session.execute(stmt)).all()
+        return {int(uid): int(cnt) for uid, cnt in rows}
+
+    async def get_passkey_by_id(
+        self,
+        session: AsyncSession,
+        passkey_id: int,
+    ) -> UserPasskey | None:
+        """
+        根据主键 ID 获取单个 Passkey 记录。
+
+        @param session: 异步数据库会话
+        @param passkey_id: Passkey 主键 ID
+        @return: UserPasskey 实例或 None
+        """
+        return await session.get(UserPasskey, passkey_id)
+
+    async def get_passkey_by_credential_id(
+        self,
+        session: AsyncSession,
+        credential_id: str,
+    ) -> UserPasskey | None:
+        """
+        根据 WebAuthn Credential ID 查询 Passkey 凭据记录。
+
+        @param session: 异步数据库会话
+        @param credential_id: Base64URL 编码的 Credential ID
+        @return: UserPasskey 实例或 None
+        """
+        stmt = select(UserPasskey).where(UserPasskey.credential_id == credential_id)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def add_passkey(self, session: AsyncSession, passkey: UserPasskey) -> UserPasskey:
+        """
+        持久化新的 Passkey 通行密钥记录并 flush。
+
+        @param session: 异步数据库会话
+        @param passkey: 待写入的 UserPasskey 实体
+        @return: 已分配主键的 UserPasskey 实体
+        """
+        session.add(passkey)
+        await session.flush()
+        return passkey
+
+    async def delete_passkey(self, session: AsyncSession, passkey: UserPasskey) -> None:
+        """
+        删除指定 Passkey 凭据记录并 flush。
+
+        @param session: 异步数据库会话
+        @param passkey: 待删除 UserPasskey 实体
+        """
+        await session.delete(passkey)
+        await session.flush()
+
+    async def add_webauthn_challenge(
+        self,
+        session: AsyncSession,
+        challenge_row: WebAuthnChallenge,
+    ) -> None:
+        """
+        保存一条短期有效的 WebAuthn 注册或认证挑战记录。
+
+        @param session: 异步数据库会话
+        @param challenge_row: WebAuthnChallenge 实体
+        """
+        session.add(challenge_row)
+        await session.flush()
+
+    async def pop_webauthn_challenge(
+        self,
+        session: AsyncSession,
+        challenge_id: str,
+    ) -> WebAuthnChallenge | None:
+        """
+        按挑战 ID 提取并立即删除对应的 WebAuthn 临时挑战（防重放单次消费）。
+
+        @param session: 异步数据库会话
+        @param challenge_id: 挑战唯一 ID
+        @return: WebAuthnChallenge 实例或 None
+        """
+        row = await session.get(WebAuthnChallenge, challenge_id)
+        if row is not None:
+            await session.delete(row)
+            await session.flush()
+        return row
+
+    async def delete_expired_webauthn_challenges(
+        self,
+        session: AsyncSession,
+        now: datetime,
+    ) -> int:
+        """
+        清理所有已过期的 WebAuthn 挑战记录。
+
+        @param session: 异步数据库会话
+        @param now: 当前 UTC 时间
+        @return: 删除的记录数
+        """
+        stmt = delete(WebAuthnChallenge).where(WebAuthnChallenge.expires_at < now)
+        result = await session.execute(stmt)
+        return int(result.rowcount or 0)
